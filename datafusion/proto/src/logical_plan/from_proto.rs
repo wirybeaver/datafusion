@@ -24,7 +24,9 @@ use datafusion_common::{
     UnnestOptions, exec_datafusion_err, internal_err, plan_datafusion_err,
 };
 use datafusion_execution::registry::FunctionRegistry;
-use datafusion_expr::dml::InsertOp;
+use datafusion_expr::dml::{
+    InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+};
 use datafusion_expr::expr::{Alias, NullTreatment, Placeholder, Sort};
 use datafusion_expr::expr::{Unnest, WildcardOptions};
 use datafusion_expr::{
@@ -241,8 +243,135 @@ impl From<protobuf::dml_node::Type> for WriteOp {
             protobuf::dml_node::Type::InsertReplace => WriteOp::Insert(InsertOp::Replace),
             protobuf::dml_node::Type::Ctas => WriteOp::Ctas,
             protobuf::dml_node::Type::Truncate => WriteOp::Truncate,
+            // MERGE_INTO carries a payload (`MergeIntoOpNode`) that this
+            // tag-only conversion cannot read; callers must use
+            // [`parse_write_op`] for `DmlNode`s with a MergeInto payload.
+            protobuf::dml_node::Type::MergeInto => unreachable!(
+                "WriteOp::MergeInto requires the MergeIntoOpNode payload; use parse_write_op",
+            ),
         }
     }
+}
+
+impl From<protobuf::merge_into_clause_node::Kind> for MergeIntoClauseKind {
+    fn from(k: protobuf::merge_into_clause_node::Kind) -> Self {
+        match k {
+            protobuf::merge_into_clause_node::Kind::Matched => {
+                MergeIntoClauseKind::Matched
+            }
+            protobuf::merge_into_clause_node::Kind::NotMatched => {
+                MergeIntoClauseKind::NotMatched
+            }
+            protobuf::merge_into_clause_node::Kind::NotMatchedByTarget => {
+                MergeIntoClauseKind::NotMatchedByTarget
+            }
+            protobuf::merge_into_clause_node::Kind::NotMatchedBySource => {
+                MergeIntoClauseKind::NotMatchedBySource
+            }
+        }
+    }
+}
+
+/// Reconstruct a [`WriteOp`] from a [`protobuf::DmlNode`], reading the
+/// `merge_into` payload when the type tag is `MergeInto`.
+pub fn parse_write_op(
+    node: &protobuf::DmlNode,
+    registry: &dyn FunctionRegistry,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<WriteOp, Error> {
+    let typ = node.dml_type();
+    if matches!(typ, protobuf::dml_node::Type::MergeInto) {
+        let merge_into = node.merge_into.as_ref().ok_or_else(|| {
+            Error::General(
+                "DmlNode with MERGE_INTO type is missing the merge_into payload"
+                    .to_string(),
+            )
+        })?;
+        return Ok(WriteOp::MergeInto(parse_merge_into_op(
+            merge_into, registry, codec,
+        )?));
+    }
+    Ok(typ.into())
+}
+
+fn parse_merge_into_op(
+    op: &protobuf::MergeIntoOpNode,
+    registry: &dyn FunctionRegistry,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<MergeIntoOp, Error> {
+    let on = op.on.as_ref().ok_or_else(|| {
+        Error::General("MergeIntoOpNode is missing required `on` expression".to_string())
+    })?;
+    let on = parse_expr(on, registry, codec)?;
+    let clauses = op
+        .clauses
+        .iter()
+        .map(|c| parse_merge_into_clause(c, registry, codec))
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(MergeIntoOp { on, clauses })
+}
+
+fn parse_merge_into_clause(
+    clause: &protobuf::MergeIntoClauseNode,
+    registry: &dyn FunctionRegistry,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<MergeIntoClause, Error> {
+    let kind = protobuf::merge_into_clause_node::Kind::try_from(clause.kind)
+        .map_err(|_| {
+            Error::General(format!(
+                "MergeIntoClauseNode has unknown kind tag {}",
+                clause.kind
+            ))
+        })?
+        .into();
+    let predicate = clause
+        .predicate
+        .as_ref()
+        .map(|e| parse_expr(e, registry, codec))
+        .transpose()?;
+    let action = clause.action.as_ref().ok_or_else(|| {
+        Error::General("MergeIntoClauseNode is missing required `action`".to_string())
+    })?;
+    let action = parse_merge_into_action(action, registry, codec)?;
+    Ok(MergeIntoClause {
+        kind,
+        predicate,
+        action,
+    })
+}
+
+fn parse_merge_into_action(
+    action: &protobuf::MergeIntoActionNode,
+    registry: &dyn FunctionRegistry,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<MergeIntoAction, Error> {
+    use protobuf::merge_into_action_node::Action;
+    let action = action.action.as_ref().ok_or_else(|| {
+        Error::General("MergeIntoActionNode is missing the `action` oneof".to_string())
+    })?;
+    Ok(match action {
+        Action::Update(update) => {
+            let assignments = update
+                .assignments
+                .iter()
+                .map(|a| {
+                    let value = a.value.as_ref().ok_or_else(|| {
+                        Error::General(format!(
+                            "MergeAssignment for column `{}` is missing its value",
+                            a.column
+                        ))
+                    })?;
+                    Ok((a.column.clone(), parse_expr(value, registry, codec)?))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            MergeIntoAction::Update(assignments)
+        }
+        Action::Insert(insert) => MergeIntoAction::Insert {
+            columns: insert.columns.clone(),
+            values: parse_exprs(&insert.values, registry, codec)?,
+        },
+        Action::Delete(_) => MergeIntoAction::Delete,
+    })
 }
 
 impl From<protobuf::NullTreatment> for NullTreatment {

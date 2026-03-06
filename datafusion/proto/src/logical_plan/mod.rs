@@ -58,7 +58,7 @@ use datafusion_expr::{
 };
 use datafusion_expr::{
     DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
-    Statement, WindowUDF, dml,
+    Statement, WindowUDF, WriteOp, dml,
     logical_plan::{
         Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateView,
         DdlStatement, Distinct, EmptyRelation, Extension, Join, JoinConstraint, Prepare,
@@ -1066,10 +1066,12 @@ impl AsLogicalPlan for LogicalPlanNode {
                 .build()
             }
             LogicalPlanType::Dml(dml_node) => {
+                let write_op =
+                    from_proto::parse_write_op(dml_node, ctx, extension_codec)?;
                 Ok(LogicalPlan::Dml(datafusion_expr::DmlStatement::new(
                     from_table_reference(dml_node.table_name.as_ref(), "DML ")?,
                     to_table_source(&dml_node.target, ctx, extension_codec)?,
-                    dml_node.dml_type().into(),
+                    write_op,
                     Arc::new(into_logical_plan!(dml_node.input, ctx, extension_codec)?),
                 )))
             }
@@ -1836,7 +1838,16 @@ impl AsLogicalPlan for LogicalPlanNode {
             }) => {
                 let input =
                     LogicalPlanNode::try_from_logical_plan(input, extension_codec)?;
-                let dml_type: dml_node::Type = op.into();
+                let (dml_type, merge_into) = match op {
+                    WriteOp::MergeInto(merge_op) => (
+                        dml_node::Type::MergeInto,
+                        Some(to_proto::serialize_merge_into_op(
+                            merge_op,
+                            extension_codec,
+                        )?),
+                    ),
+                    other => (other.into(), None),
+                };
                 Ok(LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Dml(Box::new(DmlNode {
                         input: Some(Box::new(input)),
@@ -1847,6 +1858,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                         )?)),
                         table_name: Some(table_name.clone().into()),
                         dml_type: dml_type.into(),
+                        merge_into,
                     }))),
                 })
             }
