@@ -23,7 +23,9 @@ use std::collections::HashMap;
 
 use datafusion_common::{NullEquality, TableReference, UnnestOptions};
 use datafusion_expr::WriteOp;
-use datafusion_expr::dml::InsertOp;
+use datafusion_expr::dml::{
+    InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+};
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, GroupingSet, InList,
     Like, NullTreatment, Placeholder, ScalarFunction, Unnest,
@@ -760,8 +762,95 @@ impl From<&WriteOp> for protobuf::dml_node::Type {
             WriteOp::Update => protobuf::dml_node::Type::Update,
             WriteOp::Ctas => protobuf::dml_node::Type::Ctas,
             WriteOp::Truncate => protobuf::dml_node::Type::Truncate,
+            WriteOp::MergeInto(_) => protobuf::dml_node::Type::MergeInto,
         }
     }
+}
+
+impl From<MergeIntoClauseKind> for protobuf::merge_into_clause_node::Kind {
+    fn from(k: MergeIntoClauseKind) -> Self {
+        match k {
+            MergeIntoClauseKind::Matched => {
+                protobuf::merge_into_clause_node::Kind::Matched
+            }
+            MergeIntoClauseKind::NotMatched => {
+                protobuf::merge_into_clause_node::Kind::NotMatched
+            }
+            MergeIntoClauseKind::NotMatchedByTarget => {
+                protobuf::merge_into_clause_node::Kind::NotMatchedByTarget
+            }
+            MergeIntoClauseKind::NotMatchedBySource => {
+                protobuf::merge_into_clause_node::Kind::NotMatchedBySource
+            }
+        }
+    }
+}
+
+pub fn serialize_merge_into_op(
+    op: &MergeIntoOp,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<protobuf::MergeIntoOpNode, Error> {
+    Ok(protobuf::MergeIntoOpNode {
+        on: Some(serialize_expr(&op.on, codec)?),
+        clauses: op
+            .clauses
+            .iter()
+            .map(|c| serialize_merge_into_clause(c, codec))
+            .collect::<Result<Vec<_>, Error>>()?,
+    })
+}
+
+fn serialize_merge_into_clause(
+    clause: &MergeIntoClause,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<protobuf::MergeIntoClauseNode, Error> {
+    let kind: protobuf::merge_into_clause_node::Kind = clause.kind.into();
+    let predicate = clause
+        .predicate
+        .as_ref()
+        .map(|e| serialize_expr(e, codec))
+        .transpose()?;
+    Ok(protobuf::MergeIntoClauseNode {
+        kind: kind.into(),
+        predicate,
+        action: Some(serialize_merge_into_action(&clause.action, codec)?),
+    })
+}
+
+fn serialize_merge_into_action(
+    action: &MergeIntoAction,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<protobuf::MergeIntoActionNode, Error> {
+    let action = match action {
+        MergeIntoAction::Update(assignments) => {
+            let assignments = assignments
+                .iter()
+                .map(|(column, value)| {
+                    Ok(protobuf::MergeAssignment {
+                        column: column.clone(),
+                        value: Some(serialize_expr(value, codec)?),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            protobuf::merge_into_action_node::Action::Update(
+                protobuf::MergeUpdateAction { assignments },
+            )
+        }
+        MergeIntoAction::Insert { columns, values } => {
+            protobuf::merge_into_action_node::Action::Insert(
+                protobuf::MergeInsertAction {
+                    columns: columns.clone(),
+                    values: serialize_exprs(values, codec)?,
+                },
+            )
+        }
+        MergeIntoAction::Delete => protobuf::merge_into_action_node::Action::Delete(
+            protobuf::MergeDeleteAction {},
+        ),
+    };
+    Ok(protobuf::MergeIntoActionNode {
+        action: Some(action),
+    })
 }
 
 impl From<NullTreatment> for protobuf::NullTreatment {

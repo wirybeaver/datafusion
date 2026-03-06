@@ -75,16 +75,20 @@ use datafusion_common::{
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::CopyTo;
+use datafusion_expr::dml::{
+    MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+};
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Cast, GroupingSet, InList, Like, NullTreatment,
     ScalarFunction, Unnest, WildcardOptions,
 };
 use datafusion_expr::logical_plan::{Extension, UserDefinedLogicalNodeCore};
 use datafusion_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, ExprFunctionExt, ExprSchemable,
-    LimitEffect, Literal, LogicalPlan, LogicalPlanBuilder, Operator, PartitionEvaluator,
-    ScalarUDF, Signature, TryCast, Volatility, WindowFrame, WindowFrameBound,
-    WindowFrameUnits, WindowFunctionDefinition, WindowUDF, WindowUDFImpl,
+    Accumulator, AggregateUDF, ColumnarValue, DmlStatement, ExprFunctionExt,
+    ExprSchemable, LimitEffect, Literal, LogicalPlan, LogicalPlanBuilder, Operator,
+    PartitionEvaluator, ScalarUDF, Signature, TryCast, Volatility, WindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition, WindowUDF,
+    WindowUDFImpl, WriteOp,
 };
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::expr_fn::{
@@ -428,6 +432,101 @@ async fn roundtrip_logical_plan_dml() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::test]
+async fn roundtrip_logical_plan_dml_merge_into() -> Result<()> {
+    let ctx = SessionContext::new();
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Decimal128(15, 2), true),
+    ]);
+    ctx.register_csv(
+        "t1",
+        "tests/testdata/test.csv",
+        CsvReadOptions::default().schema(&schema),
+    )
+    .await?;
+
+    let scan = ctx.table("t1").await?.into_optimized_plan()?;
+    let target = match &scan {
+        LogicalPlan::TableScan(t) => Arc::clone(&t.source),
+        other => panic!("expected TableScan, got {other:?}"),
+    };
+
+    let merge = WriteOp::MergeInto(MergeIntoOp {
+        on: col("a").eq(lit(1_i64)),
+        clauses: vec![
+            MergeIntoClause {
+                kind: MergeIntoClauseKind::Matched,
+                predicate: Some(col("b").gt(lit(ScalarValue::Decimal128(
+                    Some(0),
+                    15,
+                    2,
+                )))),
+                action: MergeIntoAction::Update(vec![("b".to_string(), col("b"))]),
+            },
+            MergeIntoClause {
+                kind: MergeIntoClauseKind::NotMatched,
+                predicate: None,
+                action: MergeIntoAction::Insert {
+                    columns: vec!["a".to_string(), "b".to_string()],
+                    values: vec![col("a"), col("b")],
+                },
+            },
+            MergeIntoClause {
+                kind: MergeIntoClauseKind::NotMatchedByTarget,
+                predicate: None,
+                action: MergeIntoAction::Insert {
+                    columns: vec![],
+                    values: vec![col("a"), col("b")],
+                },
+            },
+            MergeIntoClause {
+                kind: MergeIntoClauseKind::NotMatchedBySource,
+                predicate: Some(col("a").eq(lit(2_i64))),
+                action: MergeIntoAction::Delete,
+            },
+        ],
+    });
+
+    let plan = LogicalPlan::Dml(DmlStatement::new(
+        "t1".into(),
+        target,
+        merge,
+        Arc::new(scan),
+    ));
+
+    let bytes = logical_plan_to_bytes(&plan)?;
+    let round_trip = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+    assert_eq!(format!("{plan}"), format!("{round_trip}"));
+    Ok(())
+}
+
+#[test]
+fn parse_write_op_merge_into_without_payload_errors() {
+    let ctx = SessionContext::new();
+    let codec = DefaultLogicalExtensionCodec {};
+    let node = protobuf::DmlNode {
+        dml_type: protobuf::dml_node::Type::MergeInto.into(),
+        ..Default::default()
+    };
+    let err = from_proto::parse_write_op(&node, ctx.task_ctx().as_ref(), &codec)
+        .expect_err("MergeInto tag without payload must fail");
+    assert!(
+        err.to_string().contains("merge_into"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn write_op_to_proto_tag_for_merge_into() {
+    let op = WriteOp::MergeInto(MergeIntoOp {
+        on: lit(true),
+        clauses: vec![],
+    });
+    let tag: protobuf::dml_node::Type = (&op).into();
+    assert_eq!(tag, protobuf::dml_node::Type::MergeInto);
 }
 
 #[tokio::test]
