@@ -38,7 +38,9 @@ use datafusion_common::{
     internal_err, not_impl_err, plan_datafusion_err, plan_err, schema_err,
     unqualified_field_not_found,
 };
-use datafusion_expr::dml::{CopyTo, InsertOp};
+use datafusion_expr::dml::{
+    CopyTo, InsertOp, MergeIntoAction, MergeIntoClause, MergeIntoClauseKind, MergeIntoOp,
+};
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::DdlStatement;
 use datafusion_expr::logical_plan::builder::project;
@@ -1130,6 +1132,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let table_name = self.get_delete_target(from)?;
                 self.delete_to_plan(&table_name, selection, limit)
             }
+
+            Statement::Merge(merge) => self.merge_to_plan(merge),
 
             Statement::StartTransaction {
                 modes,
@@ -2252,6 +2256,179 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Arc::new(source),
         ));
         Ok(plan)
+    }
+
+    fn merge_to_plan(&self, merge: ast::Merge) -> Result<LogicalPlan> {
+        let ast::Merge {
+            table,
+            source,
+            on,
+            clauses,
+            into: _,
+            merge_token: _,
+            optimizer_hint,
+            output,
+        } = merge;
+
+        if optimizer_hint.is_some() {
+            plan_err!("Optimizer hints not supported")?;
+        }
+
+        if output.is_some() {
+            return not_impl_err!("MERGE OUTPUT clause is not supported");
+        }
+
+        // 1. Resolve target table
+        let (target_table_name, target_alias) = match &table {
+            TableFactor::Table { name, alias, .. } => (name.clone(), alias.clone()),
+            _ => plan_err!("Cannot MERGE INTO non-table relation!")?,
+        };
+        let target_table_ref = self.object_name_to_table_reference(target_table_name)?;
+        let target_table_source =
+            self.context_provider.get_table_source(target_table_ref.clone())?;
+        let target_schema = Arc::new(DFSchema::try_from_qualified_schema(
+            target_table_ref.clone(),
+            &target_table_source.schema(),
+        )?);
+
+        // 2. Plan the source (USING clause) as a LogicalPlan
+        let mut planner_context = PlannerContext::new();
+        let source_table_with_joins = TableWithJoins {
+            relation: source,
+            joins: vec![],
+        };
+        let source_plan = self.plan_from_tables(vec![source_table_with_joins], &mut planner_context)?;
+
+        // 3. Build a combined schema for resolving expressions in ON and WHEN clauses
+        let combined_schema = Arc::new(target_schema.as_ref().join(source_plan.schema())?);
+
+        // 4. Convert the ON condition from sqlparser Expr to datafusion Expr
+        let on_expr = self.sql_to_expr(*on, &combined_schema, &mut planner_context)?;
+
+        // 5. Convert each WHEN clause
+        let df_clauses = clauses
+            .into_iter()
+            .map(|clause| {
+                self.merge_clause_to_plan(
+                    clause,
+                    &combined_schema,
+                    &target_schema,
+                    &target_alias,
+                    &mut planner_context,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // 6. Build the DmlStatement
+        let plan = LogicalPlan::Dml(DmlStatement::new(
+            target_table_ref,
+            target_table_source,
+            WriteOp::MergeInto(MergeIntoOp {
+                on: on_expr,
+                clauses: df_clauses,
+            }),
+            Arc::new(source_plan),
+        ));
+
+        Ok(plan)
+    }
+
+    fn merge_clause_to_plan(
+        &self,
+        clause: ast::MergeClause,
+        combined_schema: &DFSchema,
+        target_schema: &DFSchema,
+        _target_alias: &Option<ast::TableAlias>,
+        planner_context: &mut PlannerContext,
+    ) -> Result<MergeIntoClause> {
+        let kind = match clause.clause_kind {
+            ast::MergeClauseKind::Matched => MergeIntoClauseKind::Matched,
+            ast::MergeClauseKind::NotMatched => MergeIntoClauseKind::NotMatched,
+            ast::MergeClauseKind::NotMatchedByTarget => {
+                MergeIntoClauseKind::NotMatchedByTarget
+            }
+            ast::MergeClauseKind::NotMatchedBySource => {
+                MergeIntoClauseKind::NotMatchedBySource
+            }
+        };
+
+        let predicate = clause
+            .predicate
+            .map(|p| self.sql_to_expr(p, combined_schema, planner_context))
+            .transpose()?;
+
+        let action = match clause.action {
+            ast::MergeAction::Update(update_expr) => {
+                let assignments = update_expr
+                    .assignments
+                    .into_iter()
+                    .map(|assign| {
+                        let col_name = match &assign.target {
+                            AssignmentTarget::ColumnName(cols) => cols
+                                .0
+                                .iter()
+                                .last()
+                                .ok_or_else(|| plan_datafusion_err!("Empty column id"))?
+                                .as_ident()
+                                .unwrap()
+                                .value
+                                .clone(),
+                            _ => plan_err!("Tuples are not supported")?,
+                        };
+                        // Validate column exists in target
+                        target_schema.field_with_unqualified_name(&col_name)?;
+                        let value = self.sql_to_expr(assign.value, combined_schema, planner_context)?;
+                        Ok((col_name, value))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                MergeIntoAction::Update(assignments)
+            }
+            ast::MergeAction::Insert(insert_expr) => {
+                let columns: Vec<String> = insert_expr
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        c.0.iter()
+                            .last()
+                            .map(|p| p.as_ident().unwrap().value.clone())
+                            .ok_or_else(|| {
+                                plan_datafusion_err!("Empty column name in MERGE INSERT")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let values = match insert_expr.kind {
+                    ast::MergeInsertKind::Values(values) => {
+                        // VALUES clause has rows; for MERGE INSERT we expect exactly one row
+                        if values.rows.len() != 1 {
+                            return plan_err!(
+                                "MERGE INSERT must have exactly one row of values"
+                            );
+                        }
+                        values
+                            .rows
+                            .into_iter()
+                            .next()
+                            .unwrap()
+                            .into_iter()
+                            .map(|v| self.sql_to_expr(v, combined_schema, planner_context))
+                            .collect::<Result<Vec<_>>>()?
+                    }
+                    ast::MergeInsertKind::Row => {
+                        return not_impl_err!("MERGE INSERT ROW is not supported");
+                    }
+                };
+
+                MergeIntoAction::Insert { columns, values }
+            }
+            ast::MergeAction::Delete { .. } => MergeIntoAction::Delete,
+        };
+
+        Ok(MergeIntoClause {
+            kind,
+            predicate,
+            action,
+        })
     }
 
     fn insert_to_plan(

@@ -823,6 +823,36 @@ impl DefaultPhysicalPlanner {
                     );
                 }
             }
+            LogicalPlan::Dml(DmlStatement {
+                table_name,
+                target,
+                op: WriteOp::MergeInto(merge_op),
+                ..
+            }) => {
+                if let Some(provider) =
+                    target.as_any().downcast_ref::<DefaultTableSource>()
+                {
+                    let input_exec = children.one()?;
+                    provider
+                        .table_provider
+                        .merge_into(
+                            session_state,
+                            input_exec,
+                            merge_op.on.clone(),
+                            merge_op.clauses.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            e.context(format!(
+                                "MERGE INTO operation on table '{table_name}'"
+                            ))
+                        })?
+                } else {
+                    return exec_err!(
+                        "Table source can't be downcasted to DefaultTableSource"
+                    );
+                }
+            }
             LogicalPlan::Window(Window { window_expr, .. }) => {
                 assert_or_internal_err!(
                     !window_expr.is_empty(),
