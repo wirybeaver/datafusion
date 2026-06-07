@@ -84,6 +84,21 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
         self.num_groups
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let total = self.len();
+        let emit_count = match emit_to {
+            EmitTo::All => total,
+            EmitTo::First(n) => (*n).min(total),
+        };
+        if total == 0 {
+            return 0;
+        }
+        // Offsets + data bytes (proportional) + null bitmap
+        (emit_count + 1) * std::mem::size_of::<O>()
+            + self.size() * emit_count / total
+            + emit_count.div_ceil(8)
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         // Reset the map to default, and convert it into a single array
         let map_contents = self.map.take().into_state();

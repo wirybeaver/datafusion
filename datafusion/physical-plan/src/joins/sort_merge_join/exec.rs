@@ -510,6 +510,7 @@ impl ExecutionPlan for SortMergeJoinExec {
             context.runtime_env(),
             SpillMetrics::new(&self.metrics, partition),
             buffered.schema(),
+            reservation.new_empty(),
         )
         .with_compression_type(context.session_config().spill_compression());
 

@@ -292,6 +292,7 @@ impl ExternalSorter {
             Arc::clone(&runtime),
             metrics.spill_metrics.clone(),
             Arc::clone(&schema),
+            reservation.new_empty(),
         )
         .with_compression_type(spill_compression);
 
@@ -2978,6 +2979,61 @@ mod tests {
         ));
         // But the TopK self-filter should be pushed down.
         assert_eq!(desc.self_filters()[0].len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_spill_reservation_balanced() -> Result<()> {
+        let session_config = SessionConfig::new();
+        let sort_spill_reservation_bytes = session_config
+            .options()
+            .execution
+            .sort_spill_reservation_bytes;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(sort_spill_reservation_bytes + 12288, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime),
+        );
+
+        let partitions = 100;
+        let input = test::scan_partitioned(partitions);
+        let schema = input.schema();
+
+        let sort_exec = Arc::new(SortExec::new(
+            [PhysicalSortExpr {
+                expr: col("i", &schema)?,
+                options: SortOptions::default(),
+            }]
+            .into(),
+            Arc::new(CoalescePartitionsExec::new(input)),
+        ));
+
+        let result = collect(
+            Arc::clone(&sort_exec) as Arc<dyn ExecutionPlan>,
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+        assert!(!result.is_empty(), "Should produce output");
+
+        let metrics = sort_exec.metrics().unwrap();
+        assert!(
+            metrics.spill_count().unwrap() > 0,
+            "Expected spilling to verify spill-path accounting"
+        );
+
+        drop(result);
+        drop(sort_exec);
+        drop(task_ctx);
+
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after sort with spilling completes"
+        );
         Ok(())
     }
 }

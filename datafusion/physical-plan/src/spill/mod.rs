@@ -54,8 +54,10 @@ use datafusion_common::config::SpillCompression;
 use datafusion_common::{DataFusionError, Result, exec_datafusion_err, exec_err};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::RecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::disk_manager::RefCountedTempFile;
-use futures::{FutureExt as _, Stream};
+use datafusion_execution::memory_pool::MemoryReservation;
+use futures::{FutureExt as _, Stream, StreamExt as _};
 use log::debug;
 
 /// Stream that reads spill files from disk where each batch is read in a spawned blocking task
@@ -69,10 +71,13 @@ struct SpillReaderStream {
     schema: SchemaRef,
     state: SpillReaderStreamState,
     /// Maximum memory size observed among spilling sorted record batches.
-    /// This is used for validation purposes during reading each RecordBatch from spill.
-    /// For context on why this value is recorded and validated,
-    /// see `physical_plan/sort/multi_level_merge.rs`.
     max_record_batch_memory: Option<usize>,
+    /// Optional reservation for tracking decoded batch memory.
+    /// When provided, grows when a batch is decoded and shrinks
+    /// when the next batch is read (previous batch consumed by caller).
+    reservation: Option<MemoryReservation>,
+    /// Size of the last decoded batch, used for shrinking on next poll.
+    last_batch_size: usize,
 }
 
 // Small margin allowed to accommodate slight memory accounting variation
@@ -102,12 +107,58 @@ impl SpillReaderStream {
         schema: SchemaRef,
         spill_file: RefCountedTempFile,
         max_record_batch_memory: Option<usize>,
+        reservation: Option<MemoryReservation>,
     ) -> Self {
         Self {
             schema,
             state: SpillReaderStreamState::Uninitialized(spill_file),
             max_record_batch_memory,
+            reservation,
+            last_batch_size: 0,
         }
+    }
+
+    /// Pre-reserve one decoded-batch slot before launching a blocking read.
+    /// Shrinks the previous batch's reservation first, then grows for the
+    /// next expected batch. Returns Err(ResourcesExhausted) if the pool
+    /// cannot accommodate the next batch.
+    fn pre_reserve_next_batch(&mut self) -> Result<()> {
+        if let (Some(res), Some(max_mem)) =
+            (&self.reservation, self.max_record_batch_memory)
+        {
+            if self.last_batch_size > 0 {
+                res.shrink(self.last_batch_size);
+                self.last_batch_size = 0;
+            }
+            res.try_grow(max_mem)?;
+            self.last_batch_size = max_mem;
+        }
+        Ok(())
+    }
+
+    /// After a decoded batch arrives, adjust the reservation from the
+    /// pre-reserved estimate to the actual batch size.
+    fn adjust_reservation_to_actual(&mut self, batch: &RecordBatch) {
+        let Some(res) = &self.reservation else {
+            return;
+        };
+        let actual_size = get_record_batch_memory_size(batch);
+
+        if self.max_record_batch_memory.is_some() {
+            // Pre-reserved path: adjust from estimate to actual
+            if actual_size > self.last_batch_size {
+                res.grow(actual_size - self.last_batch_size);
+            } else if actual_size < self.last_batch_size {
+                res.shrink(self.last_batch_size - actual_size);
+            }
+        } else {
+            // Fallback: no max_record_batch_memory, post-decode accounting
+            if self.last_batch_size > 0 {
+                res.shrink(self.last_batch_size);
+            }
+            res.grow(actual_size);
+        }
+        self.last_batch_size = actual_size;
     }
 
     fn poll_next_inner(
@@ -116,6 +167,12 @@ impl SpillReaderStream {
     ) -> Poll<Option<Result<RecordBatch>>> {
         match &mut self.state {
             SpillReaderStreamState::Uninitialized(_) => {
+                // Pre-reserve before the first blocking read
+                if let Err(e) = self.pre_reserve_next_batch() {
+                    self.state = SpillReaderStreamState::Done;
+                    return Poll::Ready(Some(Err(e)));
+                }
+
                 // Temporarily replace with `Done` to be able to pass the file to the task.
                 let SpillReaderStreamState::Uninitialized(spill_file) =
                     std::mem::replace(&mut self.state, SpillReaderStreamState::Done)
@@ -126,15 +183,10 @@ impl SpillReaderStream {
                 let expected_schema = Arc::clone(&self.schema);
                 let task = SpawnedTask::spawn_blocking(move || {
                     let file = BufReader::new(File::open(spill_file.path())?);
-                    // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
-                    // with validated schemas and buffers. Skip redundant validation during read
-                    // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
                     let mut reader = unsafe {
                         StreamReader::try_new(file, None)?.with_skip_validation(true)
                     };
 
-                    // Validate the schema read from Arrow IPC file is the same as the
-                    // schema of the current `SpillManager`
                     let actual_schema = reader.schema();
 
                     if actual_schema != expected_schema {
@@ -146,8 +198,6 @@ impl SpillReaderStream {
                         );
                     }
 
-                    // TODO: Same-schema reads from a different SpillManager still pass today.
-                    // Add a SpillManager UID to IPC metadata and validate it here as well.
                     let next_batch = reader.next().transpose()?;
 
                     Ok((reader, next_batch))
@@ -155,8 +205,6 @@ impl SpillReaderStream {
 
                 self.state = SpillReaderStreamState::ReadInProgress(task);
 
-                // Poll again immediately so the inner task is polled and the waker is
-                // registered.
                 self.poll_next_inner(cx)
             }
 
@@ -185,12 +233,21 @@ impl SpillReaderStream {
                                         );
                                     }
                                 }
+
+                                self.adjust_reservation_to_actual(&batch);
+
                                 self.state = SpillReaderStreamState::Waiting(reader);
 
                                 Poll::Ready(Some(Ok(batch)))
                             }
                             None => {
-                                // Stream is done
+                                // Stream done — release any remaining reservation
+                                if let Some(res) = &self.reservation
+                                    && self.last_batch_size > 0
+                                {
+                                    res.shrink(self.last_batch_size);
+                                    self.last_batch_size = 0;
+                                }
                                 self.state = SpillReaderStreamState::Done;
 
                                 Poll::Ready(None)
@@ -198,6 +255,13 @@ impl SpillReaderStream {
                         }
                     }
                     Err(err) => {
+                        // Release pre-reservation on error
+                        if let Some(res) = &self.reservation
+                            && self.last_batch_size > 0
+                        {
+                            res.shrink(self.last_batch_size);
+                            self.last_batch_size = 0;
+                        }
                         self.state = SpillReaderStreamState::Done;
 
                         Poll::Ready(Some(Err(err)))
@@ -206,6 +270,12 @@ impl SpillReaderStream {
             }
 
             SpillReaderStreamState::Waiting(_) => {
+                // Pre-reserve before the next blocking read
+                if let Err(e) = self.pre_reserve_next_batch() {
+                    self.state = SpillReaderStreamState::Done;
+                    return Poll::Ready(Some(Err(e)));
+                }
+
                 // Temporarily replace with `Done` to be able to pass the file to the task.
                 let SpillReaderStreamState::Waiting(mut reader) =
                     std::mem::replace(&mut self.state, SpillReaderStreamState::Done)
@@ -221,8 +291,6 @@ impl SpillReaderStream {
 
                 self.state = SpillReaderStreamState::ReadInProgress(task);
 
-                // Poll again immediately so the inner task is polled and the waker is
-                // registered.
                 self.poll_next_inner(cx)
             }
 
@@ -242,6 +310,58 @@ impl Stream for SpillReaderStream {
 impl RecordBatchStream for SpillReaderStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+/// Wraps a buffered read stream with a capacity-level `MemoryReservation`.
+///
+/// For buffered reads (via `spawn_buffered`), multiple decoded batches can
+/// be simultaneously live in the channel. Per-batch tracking in the inner
+/// stream would under-count because shrinking happens before the consumer
+/// actually drops the previous batch. Instead, the caller pre-reserves
+/// `max_batch_memory * buffer_capacity` and this wrapper holds that
+/// reservation alive until the stream is fully consumed or dropped.
+pub(crate) struct ReadStreamWithReservation {
+    stream: SendableRecordBatchStream,
+    reservation: MemoryReservation,
+}
+
+impl ReadStreamWithReservation {
+    pub(crate) fn new(
+        stream: SendableRecordBatchStream,
+        reservation: MemoryReservation,
+    ) -> Self {
+        Self {
+            stream,
+            reservation,
+        }
+    }
+}
+
+impl Stream for ReadStreamWithReservation {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Err(err))) => {
+                self.reservation.free();
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                self.reservation.free();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl RecordBatchStream for ReadStreamWithReservation {
+    fn schema(&self) -> SchemaRef {
+        self.stream.schema()
     }
 }
 
@@ -560,7 +680,6 @@ mod tests {
     use arrow::compute::cast;
     use arrow::datatypes::{DataType, Field};
     use datafusion_execution::runtime_env::RuntimeEnv;
-    use futures::StreamExt as _;
 
     #[tokio::test]
     async fn test_batch_spill_and_read() -> Result<()> {
@@ -582,7 +701,7 @@ mod tests {
         // Construct SpillManager
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema));
+        let spill_manager = SpillManager::new_default(env, metrics, Arc::clone(&schema));
 
         let spill_file = spill_manager
             .spill_record_batch_and_finish(&[batch1, batch2], "Test")?
@@ -591,7 +710,7 @@ mod tests {
         let spilled_rows = spill_manager.metrics.spilled_rows.value();
         assert_eq!(spilled_rows, num_rows);
 
-        let stream = spill_manager.read_spill_as_stream(spill_file, None)?;
+        let stream = spill_manager.read_spill_as_stream(spill_file, None, None)?;
         assert_eq!(stream.schema(), schema);
 
         let batches = collect(stream).await?;
@@ -646,7 +765,8 @@ mod tests {
         // Construct SpillManager
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&dict_schema));
+        let spill_manager =
+            SpillManager::new_default(env, metrics, Arc::clone(&dict_schema));
 
         let num_rows = batch1.num_rows() + batch2.num_rows();
         let spill_file = spill_manager
@@ -655,7 +775,7 @@ mod tests {
         let spilled_rows = spill_manager.metrics.spilled_rows.value();
         assert_eq!(spilled_rows, num_rows);
 
-        let stream = spill_manager.read_spill_as_stream(spill_file, None)?;
+        let stream = spill_manager.read_spill_as_stream(spill_file, None, None)?;
         assert_eq!(stream.schema(), dict_schema);
         let batches = collect(stream).await?;
         assert_eq!(batches.len(), 2);
@@ -674,7 +794,7 @@ mod tests {
         let schema = batch1.schema();
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema));
+        let spill_manager = SpillManager::new_default(env, metrics, Arc::clone(&schema));
 
         let row_batches: Vec<RecordBatch> =
             (0..batch1.num_rows()).map(|i| batch1.slice(i, 1)).collect();
@@ -687,7 +807,7 @@ mod tests {
         assert!(spill_file.path().exists());
         assert!(max_batch_mem > 0);
 
-        let stream = spill_manager.read_spill_as_stream(spill_file, None)?;
+        let stream = spill_manager.read_spill_as_stream(spill_file, None, None)?;
         assert_eq!(stream.schema(), schema);
 
         let batches = collect(stream).await?;
@@ -722,7 +842,7 @@ mod tests {
         let spilled_rows = spill_manager.metrics.spilled_rows.value();
         assert_eq!(spilled_rows, num_rows);
 
-        let stream = spill_manager.read_spill_as_stream(spill_file, None)?;
+        let stream = spill_manager.read_spill_as_stream(spill_file, None, None)?;
         assert_eq!(stream.schema(), schema);
 
         let batches = collect(stream).await?;
@@ -744,16 +864,16 @@ mod tests {
         let uncompressed_metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let lz4_metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let zstd_metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let uncompressed_spill_manager = SpillManager::new(
+        let uncompressed_spill_manager = SpillManager::new_default(
             Arc::clone(&env),
             uncompressed_metrics,
             Arc::clone(&schema),
         );
         let lz4_spill_manager =
-            SpillManager::new(Arc::clone(&env), lz4_metrics, Arc::clone(&schema))
+            SpillManager::new_default(Arc::clone(&env), lz4_metrics, Arc::clone(&schema))
                 .with_compression_type(SpillCompression::Lz4Frame);
         let zstd_spill_manager =
-            SpillManager::new(env, zstd_metrics, Arc::clone(&schema))
+            SpillManager::new_default(env, zstd_metrics, Arc::clone(&schema))
                 .with_compression_type(SpillCompression::Zstd);
         let uncompressed_spill_file = uncompressed_spill_manager
             .spill_record_batch_and_finish(&batches, "Test")?
@@ -814,7 +934,7 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
         ]));
 
-        let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema));
+        let spill_manager = SpillManager::new_default(env, metrics, Arc::clone(&schema));
 
         let batch = RecordBatch::try_new(
             schema,
@@ -872,7 +992,7 @@ mod tests {
         ]));
 
         let spill_manager =
-            Arc::new(SpillManager::new(env, metrics, Arc::clone(&schema)));
+            Arc::new(SpillManager::new_default(env, metrics, Arc::clone(&schema)));
         let mut in_progress_file = spill_manager.create_in_progress_file("Test")?;
 
         let batch1 = RecordBatch::try_new(
@@ -920,7 +1040,7 @@ mod tests {
         ]));
 
         let spill_manager =
-            Arc::new(SpillManager::new(env, metrics, Arc::clone(&schema)));
+            Arc::new(SpillManager::new_default(env, metrics, Arc::clone(&schema)));
 
         // Test write empty batch with interface `InProgressSpillFile` and `append_batch()`
         let mut in_progress_file = spill_manager.create_in_progress_file("Test")?;
@@ -968,7 +1088,8 @@ mod tests {
                 // Construct SpillManager
                 let env = Arc::new(RuntimeEnv::default());
                 let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-                let spill_manager = SpillManager::new(env, metrics, Arc::clone(&schema));
+                let spill_manager =
+                    SpillManager::new_default(env, metrics, Arc::clone(&schema));
                 let batches: [_; 10] = std::array::from_fn(|_| batch.clone());
 
                 let spill_file_1 = spill_manager
@@ -979,9 +1100,9 @@ mod tests {
                     .unwrap();
 
                 let mut stream_1 =
-                    spill_manager.read_spill_as_stream(spill_file_1, None)?;
+                    spill_manager.read_spill_as_stream(spill_file_1, None, None)?;
                 let mut stream_2 =
-                    spill_manager.read_spill_as_stream(spill_file_2, None)?;
+                    spill_manager.read_spill_as_stream(spill_file_2, None, None)?;
                 stream_1.next().await;
                 stream_2.next().await;
 
@@ -1012,7 +1133,7 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
         ]));
 
-        let spill_manager = Arc::new(SpillManager::new(
+        let spill_manager = Arc::new(SpillManager::new_default(
             Arc::clone(&env),
             metrics.clone(),
             Arc::clone(&schema),
@@ -1305,7 +1426,7 @@ mod tests {
 
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, schema);
+        let spill_manager = SpillManager::new_default(env, metrics, schema);
 
         let mut in_progress_file = spill_manager.create_in_progress_file("Test GC")?;
 
@@ -1478,7 +1599,7 @@ mod tests {
         // 3. Spill to disk using SpillManager
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, schema);
+        let spill_manager = SpillManager::new_default(env, metrics, schema);
         let spill_file = spill_manager
             .spill_record_batch_and_finish(&[sliced_batch], "TestGC")?
             .unwrap();
@@ -1522,7 +1643,7 @@ mod tests {
         // 3. Spill to disk using SpillManager
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager = SpillManager::new(env, metrics, schema);
+        let spill_manager = SpillManager::new_default(env, metrics, schema);
         let spill_file = spill_manager
             .spill_record_batch_and_finish(&[sliced_batch], "TestGCBinary")?
             .unwrap();

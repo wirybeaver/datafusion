@@ -1239,6 +1239,9 @@ impl ExecutionPlan for RepartitionExec {
             Arc::clone(&context.runtime_env()),
             spill_metrics,
             input.schema(),
+            MemoryConsumer::new("RepartitionSpill")
+                .with_can_spill(true)
+                .register(context.memory_pool()),
         );
 
         // Get existing ordering to use for merging

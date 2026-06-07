@@ -97,6 +97,14 @@ impl GroupValues for GroupValuesBoolean {
             + self.null_group.is_some() as usize
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let emit_count = match emit_to {
+            EmitTo::All => self.len(),
+            EmitTo::First(n) => (*n).min(self.len()),
+        };
+        emit_count.div_ceil(8) * 2
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let len = self.len();
         let mut builder = BooleanBufferBuilder::new(len);

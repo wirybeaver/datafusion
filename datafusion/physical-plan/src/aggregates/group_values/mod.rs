@@ -111,6 +111,14 @@ pub trait GroupValues: Send {
     /// Emits the group values
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
 
+    /// Returns an estimate of the memory that will be allocated by [`Self::emit`]
+    /// for the decode/output buffers.
+    ///
+    /// This is used by the aggregation operator to pre-reserve memory before
+    /// calling `emit()`, ensuring the memory pool is aware of transient
+    /// decode buffer allocations.
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize;
+
     /// Clear the contents and shrink the capacity to the size of the batch (free up memory usage)
     fn clear_shrink(&mut self, num_rows: usize);
 }

@@ -86,6 +86,17 @@ impl GroupValues for GroupValuesBytesView {
         self.num_groups
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let emit_count = match emit_to {
+            EmitTo::All => self.len(),
+            EmitTo::First(n) => (*n).min(self.len()),
+        };
+        // Views (16 bytes each) + out-of-line data estimate + null bitmap
+        emit_count * 16
+            + self.size() * emit_count / self.len().max(1)
+            + emit_count.div_ceil(8)
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {
         // Reset the map to default, and convert it into a single array
         let map_contents = self.map.take().into_state();

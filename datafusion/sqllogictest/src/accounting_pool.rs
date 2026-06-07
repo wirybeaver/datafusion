@@ -39,8 +39,9 @@ use std::sync::Arc;
 /// Headroom over the pool's declared limit. Anything past this is an
 /// untracked allocation — by definition, since DF's pool didn't see it.
 ///
-/// 800% high, but that's what it takes to pass the SLT suite right now. Goal should be ~10%
-const HEADROOM_FACTOR: f64 = 8.0;
+/// Reduced from 8.0 after adding SpillManager IPC buffer accounting,
+/// GroupValuesRows emit pre-reservation, and NLJ probe-side tracking.
+const HEADROOM_FACTOR: f64 = 6.0;
 
 pub struct AccountingMemoryPool {
     inner: Arc<dyn MemoryPool>,

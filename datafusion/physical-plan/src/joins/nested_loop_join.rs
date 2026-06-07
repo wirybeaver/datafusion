@@ -61,7 +61,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
-    JoinSide, NullEquality, Result, ScalarValue, Statistics, arrow_err,
+    DataFusionError, JoinSide, NullEquality, Result, ScalarValue, Statistics, arrow_err,
     assert_eq_or_internal_err, internal_datafusion_err, internal_err, project_schema,
     unwrap_or_internal_err,
 };
@@ -673,6 +673,11 @@ impl ExecutionPlan for NestedLoopJoinExec {
             SpillState::Disabled
         };
 
+        let probe_reservation =
+            MemoryConsumer::new(format!("NestedLoopJoinLoad[{partition}]"))
+                .with_can_spill(true)
+                .register(context.memory_pool());
+
         Ok(Box::pin(NestedLoopJoinStream::new(
             self.schema(),
             self.filter.clone(),
@@ -683,6 +688,7 @@ impl ExecutionPlan for NestedLoopJoinExec {
             metrics,
             batch_size,
             spill_state,
+            probe_reservation,
         )))
     }
 
@@ -1037,6 +1043,10 @@ pub(crate) struct NestedLoopJoinStream {
     /// Output buffer holds the join result to output. It will emit eagerly when
     /// the threshold is reached.
     output_buffer: Box<BatchCoalescer>,
+    /// Best-effort tracked size of output buffer data via try_grow.
+    /// Only the successfully reserved portion is tracked; if try_grow fails
+    /// (pool full), the batch is still pushed but not counted.
+    output_buffer_reserved: usize,
     /// See comments in [`NLJState::Done`] for its purpose
     handled_empty_output: bool,
 
@@ -1064,6 +1074,10 @@ pub(crate) struct NestedLoopJoinStream {
 
     /// Memory-limited spill fallback state. See [`SpillState`] for details.
     spill_state: SpillState,
+
+    /// Memory reservation for transient probe-side allocations
+    /// (Cartesian product indices, take() intermediates, output buffering).
+    probe_reservation: MemoryReservation,
 }
 
 pub(crate) struct NestedLoopJoinMetrics {
@@ -1315,6 +1329,7 @@ impl NestedLoopJoinStream {
         metrics: NestedLoopJoinMetrics,
         batch_size: usize,
         spill_state: SpillState,
+        probe_reservation: MemoryReservation,
     ) -> Self {
         Self {
             output_schema: Arc::clone(&schema),
@@ -1326,6 +1341,7 @@ impl NestedLoopJoinStream {
             metrics,
             buffered_left_data: None,
             output_buffer: Box::new(BatchCoalescer::new(schema, batch_size)),
+            output_buffer_reserved: 0,
             batch_size,
             current_right_batch: None,
             current_right_batch_matched: None,
@@ -1337,6 +1353,7 @@ impl NestedLoopJoinStream {
             handled_empty_output: false,
             should_track_unmatched_right: need_produce_right_in_final(join_type),
             spill_state,
+            probe_reservation,
         }
     }
 
@@ -1346,12 +1363,9 @@ impl NestedLoopJoinStream {
     }
 
     /// Check if we can fall back to memory-limited mode on this error.
-    fn can_fallback_to_spill(&self, error: &datafusion_common::DataFusionError) -> bool {
+    fn can_fallback_to_spill(&self, error: &DataFusionError) -> bool {
         matches!(self.spill_state, SpillState::Pending { .. })
-            && matches!(
-                error.find_root(),
-                datafusion_common::DataFusionError::ResourcesExhausted(_)
-            )
+            && matches!(error.find_root(), DataFusionError::ResourcesExhausted(_))
     }
 
     /// Switch from the standard OnceFut path to memory-limited mode.
@@ -1389,6 +1403,9 @@ impl NestedLoopJoinStream {
                     ctx.runtime_env(),
                     spill_metrics,
                     Arc::clone(&schema),
+                    MemoryConsumer::new("NestedLoopJoinLeftSpill")
+                        .with_can_spill(true)
+                        .register(ctx.memory_pool()),
                 )
                 .with_compression_type(ctx.session_config().spill_compression());
 
@@ -1438,6 +1455,9 @@ impl NestedLoopJoinStream {
             context.runtime_env(),
             self.metrics.spill_metrics.clone(),
             right_schema,
+            MemoryConsumer::new("NestedLoopJoinRightSpill")
+                .with_can_spill(true)
+                .register(context.memory_pool()),
         )
         .with_compression_type(context.session_config().spill_compression());
 
@@ -1528,10 +1548,11 @@ impl NestedLoopJoinStream {
         if active.left_stream.is_none() {
             match active.left_spill_fut.get_shared(cx) {
                 Poll::Ready(Ok(spill_data)) => {
-                    match spill_data
-                        .spill_manager
-                        .read_spill_as_stream(spill_data.spill_file.clone(), None)
-                    {
+                    match spill_data.spill_manager.read_spill_as_stream(
+                        spill_data.spill_file.clone(),
+                        None,
+                        None,
+                    ) {
                         Ok(stream) => {
                             active.left_schema = Some(Arc::clone(&spill_data.schema));
                             active.left_stream = Some(stream);
@@ -1570,8 +1591,10 @@ impl NestedLoopJoinStream {
 
                     if !can_grow && !active.pending_batches.is_empty() {
                         // Memory limit reached and we already have data.
-                        // Push this batch into pending (it's already in memory)
-                        // and stop buffering for this chunk.
+                        // This batch is already in memory and can't be returned
+                        // to the source. It's the documented make-progress
+                        // exception — one over-budget batch is accepted without
+                        // reservation to avoid blocking downstream operators.
                         active.pending_batches.push(batch);
                         self.left_exhausted = false;
                         self.left_buffered_in_one_pass = false;
@@ -1613,6 +1636,18 @@ impl NestedLoopJoinStream {
             self.state = NLJState::Done;
             return ControlFlow::Continue(());
         }
+
+        // RAII guard for concat dual-live overhead: both pending batches
+        // and concat result coexist during concat_batches.
+        // Named exception (infallible grow): concat is required to create
+        // JoinLeftData for probe processing, and pending batches are already
+        // in memory — the total footprint doesn't actually increase.
+        let pending_size: usize = active
+            .pending_batches
+            .iter()
+            .map(|b| b.get_array_memory_size())
+            .sum();
+        let _concat_guard = active.reservation.grow_guard(pending_size);
 
         let merged_batch = match concat_batches(
             active
@@ -1808,13 +1843,13 @@ impl NestedLoopJoinStream {
             "This state is yielding output for unmatched rows in the current right batch, so both the right batch and the bitmap must be present"
         );
         match self.process_right_unmatched() {
-            Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+            Ok(Some(batch)) => match self.push_output_batch(batch) {
                 Ok(()) => {
                     debug_assert!(self.current_right_batch.is_none());
                     self.state = NLJState::FetchingRight;
                     ControlFlow::Continue(())
                 }
-                Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
             },
             Ok(None) => {
                 debug_assert!(self.current_right_batch.is_none());
@@ -1960,9 +1995,9 @@ impl NestedLoopJoinStream {
                     self.join_type,
                     JoinSide::Right,
                 ) {
-                    Ok(Some(batch)) => match self.output_buffer.push_batch(batch) {
+                    Ok(Some(batch)) => match self.push_output_batch(batch) {
                         Ok(()) => ControlFlow::Continue(()),
-                        Err(e) => ControlFlow::Break(Poll::Ready(Some(arrow_err!(e)))),
+                        Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
                     },
                     Ok(None) => ControlFlow::Continue(()),
                     Err(e) => ControlFlow::Break(Poll::Ready(Some(Err(e)))),
@@ -2066,7 +2101,7 @@ impl NestedLoopJoinStream {
             )?;
 
             if let Some(batch) = joined_batch {
-                self.output_buffer.push_batch(batch)?;
+                self.push_output_batch(batch)?;
             }
 
             self.left_probe_idx += l_row_count;
@@ -2079,7 +2114,7 @@ impl NestedLoopJoinStream {
             self.process_single_left_row_join(&left_data, &right_batch, l_idx)?;
 
         if let Some(batch) = joined_batch {
-            self.output_buffer.push_batch(batch)?;
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2111,6 +2146,14 @@ impl NestedLoopJoinStream {
         let right_rows = right_batch.num_rows();
         let total_rows = l_row_count * right_rows;
 
+        // Named exception (infallible grow): Cartesian product index arrays
+        // are required for join correctness. The probe phase cannot be deferred
+        // or spilled once started — the left chunk is already loaded. These
+        // arrays are function-scoped and freed when _indices_guard drops.
+        // Bounded by: 2 * l_row_count * right_rows * sizeof(u32).
+        let indices_size = 2 * total_rows * size_of::<u32>();
+        let _indices_guard = self.probe_reservation.grow_guard(indices_size);
+
         // Build index arrays for cartesian product: left_range X right_batch
         let left_indices: UInt32Array =
             UInt32Array::from_iter_values((0..l_row_count).flat_map(|i| {
@@ -2129,9 +2172,31 @@ impl NestedLoopJoinStream {
         // Evaluate the join filter (if any) over an intermediate batch built
         // using the filter's own schema/column indices.
         let bitmap_combined = if let Some(filter) = &self.join_filter {
-            // Build the intermediate batch for filter evaluation
+            // Pre-estimate filter take sizes before allocation.
+            // Guard declared here (outside the if/else) so it covers the
+            // intermediate_batch through filter evaluation at line ~2213.
+            let filter_estimate = if !filter.schema.fields().is_empty() {
+                let mut est = 0usize;
+                for ci in filter.column_indices() {
+                    let col = if ci.side == JoinSide::Left {
+                        left_data.batch().column(ci.index)
+                    } else {
+                        right_batch.column(ci.index)
+                    };
+                    let col_len = col.len().max(1);
+                    est += total_rows * col.get_array_memory_size() / col_len;
+                }
+                est
+            } else {
+                0
+            };
+            // Named exception (infallible grow): filter intermediate batch is
+            // built from take() on source columns for filter evaluation. The
+            // probe phase cannot be deferred. Function-scoped, freed on drop.
+            // Bounded by: sum(total_rows * col_size / col_len) per filter column.
+            let _filter_guard = self.probe_reservation.grow_guard(filter_estimate);
+
             let intermediate_batch = if filter.schema.fields().is_empty() {
-                // Constant predicate (e.g., TRUE/FALSE). Use an empty schema with row_count
                 create_record_batch_with_empty_schema(
                     Arc::new((*filter.schema).clone()),
                     total_rows,
@@ -2149,7 +2214,6 @@ impl NestedLoopJoinStream {
                     };
                     filter_columns.push(array);
                 }
-
                 RecordBatch::try_new(Arc::new((*filter.schema).clone()), filter_columns)?
             };
 
@@ -2159,7 +2223,6 @@ impl NestedLoopJoinStream {
                 .into_array(intermediate_batch.num_rows())?;
             let filter_arr = as_boolean_array(&filter_result)?;
 
-            // Combine with null bitmap to get a unified mask
             boolean_mask_from_filter(filter_arr)
         } else {
             // No filter: all pairs match
@@ -2257,6 +2320,24 @@ impl NestedLoopJoinStream {
                 row_count,
             )?));
         }
+
+        // Pre-estimate output take sizes before allocation.
+        let mut output_estimate = 0usize;
+        for column_index in &self.column_indices {
+            let col = if column_index.side == JoinSide::Left {
+                left_data.batch().column(column_index.index)
+            } else {
+                right_batch.column(column_index.index)
+            };
+            let col_len = col.len().max(1);
+            output_estimate += total_rows * col.get_array_memory_size() / col_len;
+        }
+        // Named exception (infallible grow): output batch columns are built
+        // from take() on source arrays. The probe phase cannot be deferred.
+        // Function-scoped, freed on drop. The output batch is then moved to
+        // push_output_batch which tracks it separately via best-effort try_grow.
+        // Bounded by: sum(total_rows * col_size / col_len) per output column.
+        let _output_guard = self.probe_reservation.grow_guard(output_estimate);
 
         let mut out_columns: Vec<Arc<dyn Array>> =
             Vec::with_capacity(self.output_schema.fields().len());
@@ -2370,7 +2451,7 @@ impl NestedLoopJoinStream {
         if let Some(batch) =
             self.process_left_unmatched_range(left_data, start_idx, end_idx)?
         {
-            self.output_buffer.push_batch(batch)?;
+            self.push_output_batch(batch)?;
         }
 
         // ==== Prepare for the next iteration ====
@@ -2476,13 +2557,43 @@ impl NestedLoopJoinStream {
             .ok_or_else(|| internal_datafusion_err!("LeftData should be available"))
     }
 
+    /// Push a batch into the output buffer with best-effort memory tracking.
+    ///
+    /// Named exception (best-effort): the output batch is already allocated
+    /// by Arrow take() before reaching this point. Rejecting it would discard
+    /// valid join results without freeing the underlying allocation. Uses
+    /// try_grow so the pool counter reflects tracked output when capacity
+    /// allows, but accepts the batch regardless to avoid aborting mid-probe.
+    fn push_output_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let size = batch.get_array_memory_size();
+        let reserved = self.probe_reservation.try_grow(size).is_ok();
+        if reserved {
+            self.output_buffer_reserved += size;
+        }
+        if let Err(e) = self.output_buffer.push_batch(batch) {
+            if reserved {
+                self.probe_reservation.shrink(size);
+                self.output_buffer_reserved -= size;
+            }
+            return Err(DataFusionError::ArrowError(Box::new(e), None));
+        }
+        Ok(())
+    }
+
     /// Flush the `output_buffer` if there are batches ready to output
     /// None if no result batch ready.
     fn maybe_flush_ready_batch(&mut self) -> Option<Poll<Option<Result<RecordBatch>>>> {
         if self.output_buffer.has_completed_batch()
             && let Some(batch) = self.output_buffer.next_completed_batch()
         {
-            // Update output rows for selectivity metric
+            // Release tracked output buffer reservation
+            let batch_size = batch.get_array_memory_size();
+            let shrink = batch_size.min(self.output_buffer_reserved);
+            if shrink > 0 {
+                self.probe_reservation.shrink(shrink);
+                self.output_buffer_reserved -= shrink;
+            }
+
             let output_rows = batch.num_rows();
             self.metrics.selectivity.add_part(output_rows);
 
@@ -3929,6 +4040,160 @@ pub(crate) mod tests {
         | 2  | 2  | 80  | true  |
         +----+----+-----+-------+
         "));
+        Ok(())
+    }
+
+    /// Verify that NLJ probe-side reservation returns to zero after
+    /// join completion for both spilling (inner) and non-spilling paths.
+    #[tokio::test]
+    async fn test_nlj_reservation_balanced_after_inner_join() -> Result<()> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(50, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+        let cfg = TaskContext::default()
+            .session_config()
+            .clone()
+            .with_batch_size(16);
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(cfg)
+                .with_runtime(runtime),
+        );
+
+        let left = build_left_table();
+        let right = build_right_table();
+        let filter = prepare_join_filter();
+
+        let (_columns, batches, metrics) =
+            join_collect(left, right, &JoinType::Inner, Some(filter), task_ctx).await?;
+
+        assert!(!batches.is_empty(), "Should produce output");
+        assert!(
+            metrics.spill_count().unwrap_or(0) > 0,
+            "Expected spilling to verify spill-path accounting"
+        );
+
+        // After join completes and all streams/operators are dropped,
+        // pool should have zero reserved (all grow/shrink balanced).
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after NLJ inner join completes"
+        );
+        Ok(())
+    }
+
+    /// Verify reservation balance for RIGHT JOIN which exercises the
+    /// global right bitmap accumulation and unmatched-row emission paths.
+    #[tokio::test]
+    async fn test_nlj_reservation_balanced_after_right_join() -> Result<()> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(50, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+        let cfg = TaskContext::default()
+            .session_config()
+            .clone()
+            .with_batch_size(16);
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(cfg)
+                .with_runtime(runtime),
+        );
+
+        let left = build_left_table();
+        let right = build_right_table();
+        let filter = prepare_join_filter();
+
+        let (_columns, batches, metrics) =
+            join_collect(left, right, &JoinType::Right, Some(filter), task_ctx).await?;
+
+        assert!(!batches.is_empty(), "Should produce output");
+        assert!(
+            metrics.spill_count().unwrap_or(0) > 0,
+            "Expected spilling to verify spill-path accounting"
+        );
+
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after NLJ right join completes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nlj_reservation_balanced_after_left_join() -> Result<()> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(50, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+        let cfg = TaskContext::default()
+            .session_config()
+            .clone()
+            .with_batch_size(16);
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(cfg)
+                .with_runtime(runtime),
+        );
+
+        let left = build_left_table();
+        let right = build_right_table();
+        let filter = prepare_join_filter();
+
+        let (_columns, batches, metrics) =
+            join_collect(left, right, &JoinType::Left, Some(filter), task_ctx).await?;
+
+        assert!(!batches.is_empty(), "Should produce output");
+        assert!(
+            metrics.spill_count().unwrap_or(0) > 0,
+            "Expected spilling to verify spill-path accounting"
+        );
+
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after NLJ left join completes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_nlj_reservation_balanced_after_full_join() -> Result<()> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(50, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+        let cfg = TaskContext::default()
+            .session_config()
+            .clone()
+            .with_batch_size(16);
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(cfg)
+                .with_runtime(runtime),
+        );
+
+        let left = build_left_table();
+        let right = build_right_table();
+        let filter = prepare_join_filter();
+
+        let (_columns, batches, metrics) =
+            join_collect(left, right, &JoinType::Full, Some(filter), task_ctx).await?;
+
+        assert!(!batches.is_empty(), "Should produce output");
+        assert!(
+            metrics.spill_count().unwrap_or(0) > 0,
+            "Expected spilling to verify spill-path accounting"
+        );
+
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after NLJ full join completes"
+        );
         Ok(())
     }
 }

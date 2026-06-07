@@ -447,6 +447,12 @@ pub(crate) struct GroupedHashAggregateStream {
     /// The memory reservation for this grouping
     reservation: MemoryReservation,
 
+    /// Tracks memory for emitted output arrays that are live between
+    /// emit() and poll_next yielding them downstream. Ensures the pool
+    /// knows about in-flight batches that have left internal state but
+    /// haven't been consumed yet.
+    transient_reservation: MemoryReservation,
+
     /// The behavior to trigger when out of memory occurs
     oom_mode: OutOfMemoryMode,
 
@@ -601,6 +607,7 @@ impl GroupedHashAggregateStream {
             // to ensure fair application of back pressure amongst the memory consumers.
             .with_can_spill(oom_mode != OutOfMemoryMode::ReportError)
             .register(context.memory_pool());
+        let transient_reservation = reservation.new_empty();
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;
@@ -609,6 +616,7 @@ impl GroupedHashAggregateStream {
             context.runtime_env(),
             metrics::SpillMetrics::new(&agg.metrics, partition),
             Arc::clone(&spill_schema),
+            reservation.new_empty(),
         )
         .with_compression_type(context.session_config().spill_compression());
 
@@ -682,6 +690,7 @@ impl GroupedHashAggregateStream {
             filter_expressions,
             group_by: agg_group_by,
             reservation,
+            transient_reservation,
             oom_mode,
             group_values,
             current_group_indices: Default::default(),
@@ -862,6 +871,8 @@ impl Stream for GroupedHashAggregateStream {
                     let output_batch;
                     let size = self.batch_size;
                     (self.exec_state, output_batch) = if batch.num_rows() <= size {
+                        // Entire batch yielded — release transient reservation
+                        self.transient_reservation.free();
                         (
                             if self.input_done {
                                 ExecutionState::Done
@@ -1116,6 +1127,16 @@ impl GroupedHashAggregateStream {
             return Ok(None);
         }
 
+        // RAII guard pre-reserves memory for decode buffers allocated
+        // inside group_values.emit(). Guard automatically releases on
+        // drop (including error paths via ?).
+        let emit_estimate = self.group_values.estimated_emit_size(&emit_to);
+        let emit_guard = if emit_estimate > 0 {
+            Some(self.reservation.grow_guard(emit_estimate))
+        } else {
+            None
+        };
+
         let timer = self.group_by_metrics.emitting_time.timer();
         let mut output = self.group_values.emit(emit_to)?;
         if let EmitTo::First(n) = emit_to {
@@ -1127,18 +1148,23 @@ impl GroupedHashAggregateStream {
             if self.mode.output_mode() == AggregateOutputMode::Final && !spilling {
                 output.push(acc.evaluate(emit_to)?)
             } else {
-                // Output partial state: either because we're in a non-final mode,
-                // or because we're spilling and will merge/re-evaluate later.
                 output.extend(acc.state(emit_to)?)
             }
         }
         drop(timer);
 
-        // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
-        // over the target memory size after emission, we can emit again rather than returning Err.
+        // Release the pre-reserved emit estimate (decode buffers consumed)
+        drop(emit_guard);
+
+        // emit reduces the memory usage. Ignore Err from update_memory_reservation.
         let _ = self.update_memory_reservation();
         let batch = RecordBatch::try_new(schema, output)?;
         debug_assert!(batch.num_rows() > 0);
+
+        // Track emitted batch in transient_reservation until yielded downstream.
+        // This ensures the pool knows about in-flight output arrays.
+        let batch_size = batch.get_array_memory_size();
+        self.transient_reservation.grow(batch_size);
 
         Ok(Some(batch))
     }
@@ -1843,5 +1869,132 @@ mod tests {
             !probe.should_skip(),
             "ratio == threshold should not trigger skip (boundary is exclusive)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_reservation_balanced() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+
+        let num_rows = 500;
+        let group_ids: Vec<i32> = (0..num_rows).map(|i| i % 50).collect();
+        let values: Vec<i64> = vec![1; num_rows as usize];
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(group_ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )?;
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(8192, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let group_expr = vec![(col("group_col", &schema)?, "group_col".to_string())];
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("value_col", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("count_value")
+                .build()?,
+        )];
+
+        let exec = TestMemoryExec::try_new(&[vec![batch]], Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(group_expr),
+            aggr_expr,
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+
+        let stream = aggregate_exec.execute(0, task_ctx)?;
+        let batches: Vec<RecordBatch> = crate::common::collect(stream).await?;
+        assert!(!batches.is_empty(), "Should produce output");
+
+        drop(batches);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after aggregation completes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_reservation_balanced_group_values_rows() -> Result<()> {
+        use arrow::datatypes::TimeUnit;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("dur_key", DataType::Duration(TimeUnit::Microsecond), false),
+            Field::new("str_key", DataType::Utf8, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+
+        let num_rows = 400;
+        let dur_keys: Vec<i64> = (0..num_rows as i64).map(|i| (i % 40) * 1000).collect();
+        let str_keys: Vec<String> = (0..num_rows)
+            .map(|i| format!("group_{:04}", i % 10))
+            .collect();
+        let values: Vec<i64> = vec![1; num_rows];
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(DurationMicrosecondArray::from(dur_keys)),
+                Arc::new(StringArray::from(str_keys)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )?;
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(16384, 1.0)
+            .build_arc()?;
+        let pool = Arc::clone(&runtime.memory_pool);
+
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+
+        let group_expr = vec![
+            (col("dur_key", &schema)?, "dur_key".to_string()),
+            (col("str_key", &schema)?, "str_key".to_string()),
+        ];
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("value_col", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("count_value")
+                .build()?,
+        )];
+
+        let exec = TestMemoryExec::try_new(&[vec![batch]], Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+
+        let aggregate_exec = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(group_expr),
+            aggr_expr,
+            vec![None],
+            exec,
+            Arc::clone(&schema),
+        )?;
+
+        let stream = aggregate_exec.execute(0, task_ctx)?;
+        let batches: Vec<RecordBatch> = crate::common::collect(stream).await?;
+        assert!(!batches.is_empty(), "Should produce output");
+
+        drop(batches);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "Pool reservation should be zero after GroupValuesRows aggregation completes"
+        );
+        Ok(())
     }
 }

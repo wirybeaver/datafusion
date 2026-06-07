@@ -236,9 +236,12 @@ impl MultiLevelMergeBuilder {
             (1, 0) => {
                 let spill_file = self.sorted_spill_files.remove(0);
 
-                // Not reserving any memory for this disk as we are not holding it in memory
-                self.spill_manager
-                    .read_spill_as_stream(spill_file.file, None)
+                let read_reservation = self.reservation.take();
+                self.spill_manager.read_spill_as_stream(
+                    spill_file.file,
+                    Some(spill_file.max_record_batch_memory),
+                    Some(read_reservation),
+                )
             }
 
             // Only in memory streams, so merge them all in a single pass
@@ -292,6 +295,7 @@ impl MultiLevelMergeBuilder {
                         .read_spill_as_stream(
                             spill.file,
                             Some(spill.max_record_batch_memory),
+                            None,
                         )?;
                     sorted_streams.push(stream);
                 }

@@ -165,6 +165,14 @@ where
         self.values.len()
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let emit_count = match emit_to {
+            EmitTo::All => self.len(),
+            EmitTo::First(n) => (*n).min(self.len()),
+        };
+        emit_count * std::mem::size_of::<T::Native>() + emit_count.div_ceil(8)
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         fn build_primitive<T: ArrowPrimitiveType>(
             values: Vec<T::Native>,

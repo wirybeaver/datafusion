@@ -399,6 +399,7 @@ impl Drop for SpillPoolWriter {
 /// # use datafusion_physical_plan::spill::spill_pool;
 /// # use datafusion_physical_plan::spill::SpillManager; // Re-exported for doctests
 /// # use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
+/// # use datafusion_execution::memory_pool::MemoryConsumer;
 /// #
 /// # #[tokio::main]
 /// # async fn main() -> datafusion_common::Result<()> {
@@ -406,7 +407,8 @@ impl Drop for SpillPoolWriter {
 /// # let env = Arc::new(RuntimeEnv::default());
 /// # let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
 /// # let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-/// # let spill_manager = Arc::new(SpillManager::new(env, metrics, schema.clone()));
+/// # let reservation = MemoryConsumer::new("example").with_can_spill(true).register(&env.memory_pool);
+/// # let spill_manager = Arc::new(SpillManager::new(Arc::clone(&env), metrics, schema.clone(), reservation));
 /// #
 /// // Create channel with 1MB file size limit
 /// let (writer, mut reader) = spill_pool::channel(1024 * 1024, spill_manager);
@@ -565,7 +567,7 @@ impl Stream for SpillFile {
                 // we want this unbuffered because files are actively being written to
                 match self
                     .spill_manager
-                    .read_spill_as_stream_unbuffered(file, None)
+                    .read_spill_as_stream_unbuffered(file, None, None)
                 {
                     Ok(stream) => {
                         self.reader = Some(SpillFileReader {
@@ -767,7 +769,7 @@ mod tests {
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let schema = create_test_schema();
-        let spill_manager = Arc::new(SpillManager::new(env, metrics, schema));
+        let spill_manager = Arc::new(SpillManager::new_default(env, metrics, schema));
 
         channel(max_file_size, spill_manager)
     }
@@ -778,7 +780,8 @@ mod tests {
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let schema = create_test_schema();
-        let spill_manager = Arc::new(SpillManager::new(env, metrics.clone(), schema));
+        let spill_manager =
+            Arc::new(SpillManager::new_default(env, metrics.clone(), schema));
 
         let (writer, reader) = channel(max_file_size, spill_manager);
         (writer, reader, metrics)
@@ -1319,8 +1322,11 @@ mod tests {
         let env = Arc::new(RuntimeEnv::default());
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let schema = create_test_schema();
-        let spill_manager =
-            Arc::new(SpillManager::new(Arc::clone(&env), metrics.clone(), schema));
+        let spill_manager = Arc::new(SpillManager::new_default(
+            Arc::clone(&env),
+            metrics.clone(),
+            schema,
+        ));
 
         let (writer, mut reader) = channel(1024 * 1024, spill_manager);
 
@@ -1461,7 +1467,8 @@ mod tests {
 
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let schema = create_test_schema();
-        let spill_manager = Arc::new(SpillManager::new(runtime, metrics.clone(), schema));
+        let spill_manager =
+            Arc::new(SpillManager::new_default(runtime, metrics.clone(), schema));
 
         let (writer, mut reader) = channel(batch_size, spill_manager);
 

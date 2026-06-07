@@ -4021,7 +4021,7 @@ fn test_stream_resources(
     let ctx = TaskContext::default();
     let runtime_env = ctx.runtime_env();
     let reservation = MemoryConsumer::new("test").register(ctx.memory_pool());
-    let spill_manager = SpillManager::new(
+    let spill_manager = SpillManager::new_default(
         Arc::clone(&runtime_env),
         SpillMetrics::new(metrics, 0),
         inner_schema,
@@ -4676,7 +4676,7 @@ async fn spill_filtered_boundary_loses_outer_rows() -> Result<()> {
 
         let metrics = ExecutionPlanMetricsSet::new();
         let reservation = MemoryConsumer::new("test").register(&runtime.memory_pool);
-        let spill_manager = SpillManager::new(
+        let spill_manager = SpillManager::new_default(
             Arc::clone(&runtime),
             SpillMetrics::new(&metrics, 0),
             Arc::clone(&right_schema),

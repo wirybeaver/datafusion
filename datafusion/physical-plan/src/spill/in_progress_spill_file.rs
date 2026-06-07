@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_execution::disk_manager::RefCountedTempFile;
+use datafusion_execution::memory_pool::MemoryReservation;
 
 use super::{
     IPCStreamWriter, gc_view_arrays,
@@ -38,18 +39,29 @@ pub struct InProgressSpillFile {
     writer: Option<IPCStreamWriter>,
     /// Lazily initialized in-progress file, it will be moved out when the `finish` method is invoked
     in_progress_file: Option<RefCountedTempFile>,
+    /// Memory reservation for tracking IPC write buffer overhead.
+    /// `append_batch` reserves memory before writing and releases it
+    /// after the write completes. Freed automatically on Drop.
+    reservation: MemoryReservation,
 }
 
 impl InProgressSpillFile {
     pub fn new(
         spill_writer: Arc<SpillManager>,
         in_progress_file: RefCountedTempFile,
+        reservation: MemoryReservation,
     ) -> Self {
         Self {
             spill_writer,
             in_progress_file: Some(in_progress_file),
             writer: None,
+            reservation,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reservation_size(&self) -> usize {
+        self.reservation.size()
     }
 
     /// Appends a `RecordBatch` to the spill file, initializing the writer if necessary.
@@ -71,13 +83,24 @@ impl InProgressSpillFile {
             ));
         }
 
+        // Named exception (infallible grow): spill writes MUST complete
+        // even under memory pressure. Operators free their main reservation
+        // before spilling; failing here would prevent memory recovery.
+        // The grow/shrink is balanced within each call — the reservation
+        // returns to its pre-call size after the write completes or errors.
+        let write_overhead = batch.get_array_memory_size();
+        self.reservation.grow(write_overhead);
+
+        let result = self.append_batch_inner(batch);
+
+        self.reservation.shrink(write_overhead);
+        result
+    }
+
+    fn append_batch_inner(&mut self, batch: &RecordBatch) -> Result<usize> {
         let gc_batch = gc_view_arrays(batch)?;
 
         if self.writer.is_none() {
-            // Use the SpillManager's declared schema rather than the batch's schema.
-            // Individual batches may have different schemas (e.g., different nullability)
-            // when they come from different branches of a UnionExec. The SpillManager's
-            // schema represents the canonical schema that all batches should conform to.
             let schema = self.spill_writer.schema();
             if let Some(in_progress_file) = &mut self.in_progress_file {
                 self.writer = Some(IPCStreamWriter::new(
@@ -86,10 +109,8 @@ impl InProgressSpillFile {
                     self.spill_writer.compression,
                 )?);
 
-                // Update metrics
                 self.spill_writer.metrics.spill_file_count.add(1);
 
-                // Update initial size (schema/header)
                 in_progress_file.update_disk_usage()?;
                 let initial_size = in_progress_file.current_disk_usage();
                 self.spill_writer
@@ -111,9 +132,10 @@ impl InProgressSpillFile {
                     .spilled_bytes
                     .add((post_size - pre_size) as usize);
             } else {
-                unreachable!() // Already checked inside current function
+                unreachable!()
             }
         }
+
         gc_batch.get_sliced_size()
     }
 
@@ -180,7 +202,7 @@ mod tests {
         let runtime = Arc::new(RuntimeEnvBuilder::new().build()?);
         let metrics_set = ExecutionPlanMetricsSet::new();
         let spill_metrics = SpillMetrics::new(&metrics_set, 0);
-        let spill_manager = Arc::new(SpillManager::new(
+        let spill_manager = Arc::new(SpillManager::new_default(
             runtime,
             spill_metrics,
             Arc::clone(&nullable_schema),
@@ -210,7 +232,7 @@ mod tests {
 
         let spill_file = in_progress.finish()?.unwrap();
 
-        let stream = spill_manager.read_spill_as_stream(spill_file, None)?;
+        let stream = spill_manager.read_spill_as_stream(spill_file, None, None)?;
 
         // Stream schema should be nullable
         assert_eq!(stream.schema(), nullable_schema);

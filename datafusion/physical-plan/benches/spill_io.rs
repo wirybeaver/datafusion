@@ -27,6 +27,7 @@ use criterion::{
 use datafusion_common::config::SpillCompression;
 use datafusion_common::human_readable_size;
 use datafusion_common::instant::Instant;
+use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_plan::SpillManager;
 use datafusion_physical_plan::common::collect;
@@ -90,7 +91,14 @@ fn bench_spill_io(c: &mut Criterion) {
         Field::new("c2", DataType::Date32, true),
         Field::new("c3", DataType::Decimal128(11, 2), true),
     ]));
-    let spill_manager = SpillManager::new(env, metrics, schema);
+    let spill_manager = SpillManager::new(
+        Arc::clone(&env),
+        metrics,
+        Arc::clone(&schema),
+        MemoryConsumer::new("bench")
+            .with_can_spill(true)
+            .register(&env.memory_pool),
+    );
 
     let mut group = c.benchmark_group("spill_io");
     let rt = Runtime::new().unwrap();
@@ -116,7 +124,7 @@ fn bench_spill_io(c: &mut Criterion) {
                 |spill_file| {
                     rt.block_on(async {
                         let stream = spill_manager
-                            .read_spill_as_stream(spill_file, None)
+                            .read_spill_as_stream(spill_file, None, None)
                             .unwrap();
                         let _ = collect(stream).await.unwrap();
                     })
@@ -504,9 +512,15 @@ fn benchmark_spill_batches_for_all_codec(
 
     for &compression in compressions {
         let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let spill_manager =
-            SpillManager::new(Arc::clone(&env), metrics.clone(), Arc::clone(&schema))
-                .with_compression_type(compression);
+        let spill_manager = SpillManager::new(
+            Arc::clone(&env),
+            metrics.clone(),
+            Arc::clone(&schema),
+            MemoryConsumer::new("bench")
+                .with_can_spill(true)
+                .register(&env.memory_pool),
+        )
+        .with_compression_type(compression);
 
         let bench_id = BenchmarkId::new(batch_label, compression.to_string());
         group.bench_with_input(bench_id, &spill_manager, |b, spill_manager| {
@@ -522,7 +536,7 @@ fn benchmark_spill_batches_for_all_codec(
                             .unwrap()
                             .unwrap();
                         let stream = spill_manager
-                            .read_spill_as_stream(spill_file, None)
+                            .read_spill_as_stream(spill_file, None, None)
                             .unwrap();
                         let _ = collect(stream).await.unwrap();
                     })
@@ -557,7 +571,7 @@ fn benchmark_spill_batches_for_all_codec(
         let start = Instant::now();
         rt.block_on(async {
             let stream = spill_manager
-                .read_spill_as_stream(spill_file, None)
+                .read_spill_as_stream(spill_file, None, None)
                 .unwrap();
             let _ = collect(stream).await.unwrap();
         });

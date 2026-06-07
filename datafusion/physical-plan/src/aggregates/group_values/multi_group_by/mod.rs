@@ -1088,6 +1088,19 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         self.group_values[0].len()
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let total = self.len();
+        let emit_count = match emit_to {
+            EmitTo::All => total,
+            EmitTo::First(n) => (*n).min(total),
+        };
+        if total == 0 {
+            return 0;
+        }
+        let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
+        group_values_size * emit_count / total
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let mut output = match emit_to {
             EmitTo::All => {

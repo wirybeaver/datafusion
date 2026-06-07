@@ -225,7 +225,7 @@ impl ReplayableSpillStream {
         spill_file: Option<RefCountedTempFile>,
     ) -> Result<Self> {
         let inner = if let Some(file) = spill_file.as_ref() {
-            spill_manager.read_spill_as_stream(file.clone(), None)?
+            spill_manager.read_spill_as_stream(file.clone(), None, None)?
         } else {
             Box::pin(EmptyRecordBatchStream::new(Arc::clone(&schema)))
         };
@@ -344,7 +344,7 @@ mod tests {
         let runtime = Arc::new(RuntimeEnvBuilder::new().build()?);
         let metrics_set = ExecutionPlanMetricsSet::new();
         let spill_metrics = SpillMetrics::new(&metrics_set, 0);
-        Ok(SpillManager::new(runtime, spill_metrics, schema))
+        Ok(SpillManager::new_default(runtime, spill_metrics, schema))
     }
 
     fn build_batch(schema: SchemaRef, values: Vec<i64>) -> Result<RecordBatch> {

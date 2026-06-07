@@ -521,6 +521,68 @@ impl MemoryReservation {
     pub fn take(&mut self) -> MemoryReservation {
         self.split(self.size.load(atomic::Ordering::Relaxed))
     }
+
+    /// Attempts to grow the reservation by `capacity` bytes and returns
+    /// a [`ReservationGuard`] that will automatically shrink the reservation
+    /// when dropped.
+    ///
+    /// This is useful for tracking transient allocations that are freed
+    /// when a scope exits (including error paths via `?`).
+    ///
+    /// Call [`ReservationGuard::release`] to prevent the automatic shrink
+    /// when ownership of the allocated memory is transferred elsewhere.
+    pub fn try_grow_guard(&self, capacity: usize) -> Result<ReservationGuard<'_>> {
+        self.try_grow(capacity)?;
+        Ok(ReservationGuard {
+            reservation: self,
+            size: capacity,
+        })
+    }
+
+    /// Grows the reservation by `capacity` bytes (infallible) and returns
+    /// a [`ReservationGuard`] that will automatically shrink on drop.
+    ///
+    /// Use only for named exceptions where the allocation is required for
+    /// correctness/progress and cannot be deferred (e.g., join probe-side
+    /// index arrays that must be allocated to produce results).
+    pub fn grow_guard(&self, capacity: usize) -> ReservationGuard<'_> {
+        self.grow(capacity);
+        ReservationGuard {
+            reservation: self,
+            size: capacity,
+        }
+    }
+}
+
+/// RAII guard that automatically shrinks a [`MemoryReservation`] on drop.
+///
+/// Created by [`MemoryReservation::try_grow_guard`]. When the guard is
+/// dropped, it shrinks the reservation by the guarded size. Call
+/// [`Self::release`] to transfer ownership and prevent the automatic shrink.
+pub struct ReservationGuard<'a> {
+    reservation: &'a MemoryReservation,
+    size: usize,
+}
+
+impl ReservationGuard<'_> {
+    /// Prevents the automatic shrink on drop, effectively transferring
+    /// ownership of the reserved bytes to a longer-lived reservation.
+    pub fn release(mut self) {
+        self.size = 0;
+    }
+
+    /// Returns the guarded size in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.size > 0 {
+            self.reservation.shrink(self.size);
+        }
+    }
 }
 
 impl Drop for MemoryReservation {
@@ -669,5 +731,56 @@ mod tests {
         assert_eq!(new_size, 0);
         assert_eq!(r1.size(), 0);
         assert_eq!(pool.reserved(), 80);
+    }
+
+    #[test]
+    fn test_try_grow_guard_auto_shrinks() {
+        let pool = Arc::new(GreedyMemoryPool::new(1000)) as _;
+        let r1 = MemoryConsumer::new("test").register(&pool);
+
+        {
+            let _guard = r1.try_grow_guard(100).unwrap();
+            assert_eq!(r1.size(), 100);
+            assert_eq!(pool.reserved(), 100);
+        }
+        assert_eq!(r1.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn test_try_grow_guard_release_prevents_shrink() {
+        let pool = Arc::new(GreedyMemoryPool::new(1000)) as _;
+        let r1 = MemoryConsumer::new("test").register(&pool);
+
+        {
+            let guard = r1.try_grow_guard(100).unwrap();
+            guard.release();
+        }
+        assert_eq!(r1.size(), 100);
+        assert_eq!(pool.reserved(), 100);
+    }
+
+    #[test]
+    fn test_grow_guard_auto_shrinks() {
+        let pool = Arc::new(GreedyMemoryPool::new(1000)) as _;
+        let r1 = MemoryConsumer::new("test").register(&pool);
+
+        {
+            let _guard = r1.grow_guard(200);
+            assert_eq!(r1.size(), 200);
+        }
+        assert_eq!(r1.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn test_try_grow_guard_error_path() {
+        let pool = Arc::new(GreedyMemoryPool::new(50)) as _;
+        let r1 = MemoryConsumer::new("test").register(&pool);
+
+        let result = r1.try_grow_guard(100);
+        assert!(result.is_err());
+        assert_eq!(r1.size(), 0);
+        assert_eq!(pool.reserved(), 0);
     }
 }

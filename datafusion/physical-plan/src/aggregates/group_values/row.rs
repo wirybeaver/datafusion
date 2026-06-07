@@ -195,6 +195,21 @@ impl GroupValues for GroupValuesRows {
             .unwrap_or(0)
     }
 
+    fn estimated_emit_size(&self, emit_to: &EmitTo) -> usize {
+        let total_rows = self.len();
+        if total_rows == 0 {
+            return 0;
+        }
+        let rows_size = self.group_values.as_ref().map(|v| v.size()).unwrap_or(0);
+        match emit_to {
+            EmitTo::All => rows_size,
+            EmitTo::First(n) => {
+                let n = (*n).min(total_rows);
+                rows_size * n / total_rows
+            }
+        }
+    }
+
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let mut group_values = self
             .group_values
