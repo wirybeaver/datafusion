@@ -44,6 +44,7 @@ use datafusion_common::{
     internal_err, resources_datafusion_err,
 };
 use datafusion_execution::TaskContext;
+use datafusion_execution::memory_pool::arrow::{ArrowMemoryPool, claim_batch};
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::{EmitTo, GroupsAccumulator};
@@ -447,6 +448,15 @@ pub(crate) struct GroupedHashAggregateStream {
     /// The memory reservation for this grouping
     reservation: MemoryReservation,
 
+    /// Arrow memory pool backed by a sibling of `reservation` (same pool consumer).
+    ///
+    /// `claim_batch` in `emit()` grows the sibling reservation by the output
+    /// batch's buffer sizes. Because `from_reservation` uses `new_empty()` to
+    /// share the same registration, neither `FairSpillPool::num_spill` nor
+    /// `unspillable` changes, and `update_memory_reservation()` cannot
+    /// accidentally shrink the sibling below zero.
+    arrow_pool: Arc<ArrowMemoryPool>,
+
     /// The behavior to trigger when out of memory occurs
     oom_mode: OutOfMemoryMode,
 
@@ -601,6 +611,10 @@ impl GroupedHashAggregateStream {
             // to ensure fair application of back pressure amongst the memory consumers.
             .with_can_spill(oom_mode != OutOfMemoryMode::ReportError)
             .register(context.memory_pool());
+        let arrow_pool = Arc::new(ArrowMemoryPool::from_reservation(
+            Arc::clone(context.memory_pool()),
+            &reservation,
+        ));
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;
@@ -682,6 +696,7 @@ impl GroupedHashAggregateStream {
             filter_expressions,
             group_by: agg_group_by,
             reservation,
+            arrow_pool,
             oom_mode,
             group_values,
             current_group_indices: Default::default(),
@@ -1139,7 +1154,9 @@ impl GroupedHashAggregateStream {
         let _ = self.update_memory_reservation();
         let batch = RecordBatch::try_new(schema, output)?;
         debug_assert!(batch.num_rows() > 0);
-
+        if !spilling {
+            claim_batch(&batch, self.arrow_pool.as_ref());
+        }
         Ok(Some(batch))
     }
 

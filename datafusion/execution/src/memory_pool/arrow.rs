@@ -18,31 +18,92 @@
 //! Adapter for integrating DataFusion's [`MemoryPool`] with Arrow's memory tracking APIs.
 
 use crate::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation};
+use arrow::array::Array;
+use arrow::record_batch::RecordBatch;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 /// An adapter that implements Arrow's [`arrow_buffer::MemoryPool`] trait
 /// by wrapping a DataFusion [`MemoryPool`].
 ///
-/// This allows DataFusion's memory management system to be used with Arrow's
-/// memory allocation APIs. Each reservation made through this pool will be
-/// tracked using the provided [`MemoryConsumer`], enabling DataFusion to
-/// monitor and limit memory usage across Arrow operations.
+/// All reservations made through this pool grow a single shared
+/// [`MemoryReservation`]. This keeps `FairSpillPool`'s bookkeeping correct:
 ///
-/// This is useful when you want Arrow operations (such as array builders
-/// or compute kernels) to participate in DataFusion's memory management
-/// and respect the same memory limits as DataFusion operators.
+/// - [`Self::new`] creates its own consumer registration — use this when the
+///   pool stands alone (e.g. tests, standalone Arrow computation).
+/// - [`Self::from_reservation`] re-uses an existing reservation — use this
+///   inside an operator so that claimed Arrow-buffer bytes are accounted under
+///   the *same* pool consumer as the operator's main reservation. That way
+///   neither `num_spill` nor `unspillable` changes, and the fair-share
+///   formula is unaffected.
 #[derive(Debug)]
 pub struct ArrowMemoryPool {
     inner: Arc<dyn MemoryPool>,
-    consumer: MemoryConsumer,
+    shared: Arc<MemoryReservation>,
 }
 
 impl ArrowMemoryPool {
-    /// Creates a new [`ArrowMemoryPool`] that wraps the given DataFusion [`MemoryPool`]
-    /// and tracks allocations under the specified [`MemoryConsumer`].
+    /// Creates a new [`ArrowMemoryPool`] with its own consumer registration.
     pub fn new(inner: Arc<dyn MemoryPool>, consumer: MemoryConsumer) -> Self {
-        Self { inner, consumer }
+        let shared = Arc::new(consumer.register(&inner));
+        Self { inner, shared }
+    }
+
+    /// Creates a pool backed by a sibling of `reservation`.
+    ///
+    /// Calls [`MemoryReservation::new_empty`] to create a zero-size reservation
+    /// that shares the same [`Arc`] registration (and therefore the same pool
+    /// consumer) as `reservation`. This means:
+    ///
+    /// - No new consumer is registered: `FairSpillPool::num_spill` and
+    ///   `unspillable` are both unaffected.
+    /// - Claimed bytes are counted toward the same `spillable`/`unspillable`
+    ///   bucket as the operator's main reservation.
+    /// - The per-reservation `size` field checked by `FairSpillPool`'s
+    ///   fair-share formula is **independent** of the main reservation's size,
+    ///   so `update_memory_reservation()` cannot undercut live claim handles.
+    pub fn from_reservation(
+        inner: Arc<dyn MemoryPool>,
+        reservation: &MemoryReservation,
+    ) -> Self {
+        let shared = Arc::new(reservation.new_empty());
+        Self { inner, shared }
+    }
+}
+
+/// Tracks one buffer's share of the [`ArrowMemoryPool`] shared reservation.
+///
+/// On resize it adjusts the shared [`MemoryReservation`] by the delta.
+/// On drop it releases the buffer's bytes from the shared reservation.
+///
+/// `MemoryReservation` uses atomic interior mutability, so no external lock is
+/// needed: `grow` / `shrink` are `&self` methods.
+#[derive(Debug)]
+struct SharedClaimHandle {
+    shared: Arc<MemoryReservation>,
+    size: usize,
+}
+
+impl arrow_buffer::MemoryReservation for SharedClaimHandle {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn resize(&mut self, new_size: usize) {
+        match new_size.cmp(&self.size) {
+            std::cmp::Ordering::Greater => self.shared.grow(new_size - self.size),
+            std::cmp::Ordering::Less => self.shared.shrink(self.size - new_size),
+            std::cmp::Ordering::Equal => {}
+        }
+        self.size = new_size;
+    }
+}
+
+impl Drop for SharedClaimHandle {
+    fn drop(&mut self) {
+        if self.size > 0 {
+            self.shared.shrink(self.size);
+        }
     }
 }
 
@@ -58,11 +119,11 @@ impl arrow_buffer::MemoryReservation for MemoryReservation {
 
 impl arrow_buffer::MemoryPool for ArrowMemoryPool {
     fn reserve(&self, size: usize) -> Box<dyn arrow_buffer::MemoryReservation> {
-        let consumer = self.consumer.clone_with_new_id();
-        let reservation = consumer.register(&self.inner);
-        reservation.grow(size);
-
-        Box::new(reservation)
+        self.shared.grow(size);
+        Box::new(SharedClaimHandle {
+            shared: Arc::clone(&self.shared),
+            size,
+        })
     }
 
     fn available(&self) -> isize {
@@ -84,20 +145,31 @@ impl arrow_buffer::MemoryPool for ArrowMemoryPool {
     }
 }
 
+/// Claims all Arrow buffers in `array` against `pool` (idempotent, recursive).
+///
+/// Uses [`arrow_data::ArrayData::claim`], which covers data buffers, null buffers,
+/// and all child arrays. Claiming the same physical buffer twice is a no-op.
+pub fn claim_array(array: &dyn Array, pool: &dyn arrow_buffer::MemoryPool) {
+    array.to_data().claim(pool);
+}
+
+/// Claims all Arrow buffers in every column of `batch` against `pool`.
+///
+/// See [`claim_array`] for semantics. This is the primary entry point for
+/// registering output [`RecordBatch`] memory with a [`MemoryPool`] at output
+/// boundaries, replacing manual `get_array_memory_size()` bookkeeping.
+pub fn claim_batch(batch: &RecordBatch, pool: &dyn arrow_buffer::MemoryPool) {
+    for col in batch.columns() {
+        claim_array(col.as_ref(), pool);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
-    use arrow::array::{Array, Int32Array};
+    use arrow::array::Int32Array;
     use arrow_buffer::MemoryPool;
-
-    // Until https://github.com/apache/arrow-rs/pull/8918 lands, we need to iterate all
-    // buffers in the array. Change once the PR is released.
-    fn claim_array(array: &dyn Array, pool: &dyn MemoryPool) {
-        for buffer in array.to_data().buffers() {
-            buffer.claim(pool);
-        }
-    }
 
     #[test]
     pub fn can_claim_array() {

@@ -38,6 +38,7 @@ all-features = true
 workspace = true
 
 [features]
+arrow_buffer_pool = ["datafusion-execution/arrow_buffer_pool"]
 force_hash_collisions = []
 test_utils = ["arrow/test_utils"]
 tokio_coop = []
