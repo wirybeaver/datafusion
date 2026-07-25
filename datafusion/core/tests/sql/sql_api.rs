@@ -254,19 +254,39 @@ async fn merge_into_rejects_source_alias_colliding_with_target_name() {
 }
 
 #[tokio::test]
-async fn merge_into_rejects_subqueries_correlated_to_target_alias() {
+async fn merge_into_handles_subquery_target_alias_scopes() {
     let ctx = merge_into_context().await;
-    assert_merge_sql_error(
-        &ctx,
+    for sql in [
         "MERGE INTO target AS t USING source AS s \
          ON EXISTS (SELECT 1 FROM source AS x WHERE x.id = t.id) \
          WHEN MATCHED THEN DELETE",
-        "MERGE subqueries correlated to target alias 't' are not supported",
-    )
-    .await;
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS q \
+           WHERE EXISTS (SELECT 1 FROM source AS x WHERE x.id = t.id)) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS q \
+           CROSS JOIN LATERAL (SELECT t.id) AS l) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT t.id FROM source AS t \
+           LIMIT (SELECT t.id FROM source AS x LIMIT 1)) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS q CROSS JOIN (
+           source AS x CROSS JOIN LATERAL (SELECT t.id) AS l
+         )) WHEN MATCHED THEN DELETE",
+    ] {
+        assert_merge_sql_error(
+            &ctx,
+            sql,
+            "MERGE subqueries correlated to target alias 't' are not supported",
+        )
+        .await;
+    }
 
-    // Source-correlated and uncorrelated subqueries remain supported through
-    // logical optimization.
+    // Source-correlated, uncorrelated, and locally shadowed target aliases
+    // remain supported through logical optimization.
     for sql in [
         "MERGE INTO target AS t USING source AS s \
          ON EXISTS (SELECT 1 FROM source AS x WHERE x.id = s.id) \
@@ -274,6 +294,28 @@ async fn merge_into_rejects_subqueries_correlated_to_target_alias() {
         "MERGE INTO target AS t USING source AS s \
          ON t.id = ANY (SELECT id FROM source) \
          WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS t \
+           WHERE EXISTS (SELECT 1 FROM source AS x WHERE x.id = t.id)) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT EXISTS (
+           SELECT 1 FROM source AS x WHERE x.id = t.id
+         ) FROM source AS t) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS t \
+           WHERE EXISTS (SELECT 1 FROM source AS q \
+             WHERE EXISTS (SELECT 1 FROM source AS x WHERE x.id = t.id))) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS t \
+           CROSS JOIN LATERAL (SELECT t.id) AS l) \
+         WHEN MATCHED THEN DELETE",
+        "MERGE INTO target AS t USING source AS s \
+         ON EXISTS (SELECT 1 FROM source AS t CROSS JOIN (
+           source AS x CROSS JOIN LATERAL (SELECT t.id) AS l
+         )) WHEN MATCHED THEN DELETE",
     ] {
         assert_merge_physical_error(&ctx, sql, "MERGE INTO not supported for Base table")
             .await;

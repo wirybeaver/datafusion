@@ -46,7 +46,7 @@ use datafusion_expr::dml::{
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas_and_ambiguity_check;
 use datafusion_expr::logical_plan::DdlStatement;
 use datafusion_expr::logical_plan::builder::project;
-use datafusion_expr::utils::expr_to_columns;
+use datafusion_expr::utils::{expr_to_columns, merge_schema};
 use datafusion_expr::{
     Analyze, CreateCatalog, CreateCatalogSchema,
     CreateExternalTable as PlanCreateExternalTable, CreateFunction, CreateFunctionBody,
@@ -54,8 +54,8 @@ use datafusion_expr::{
     DescribeTable, DmlStatement, DropCatalogSchema, DropFunction, DropTable, DropView,
     EmptyRelation, Execute, Explain, ExplainFormat, Expr, ExprSchemable, Filter,
     LogicalPlan, LogicalPlanBuilder, OperateFunctionArg, PlanType, Prepare,
-    ResetVariable, SetVariable, SortExpr, Statement as PlanStatement, ToStringifiedPlan,
-    TransactionAccessMode, TransactionConclusion, TransactionEnd,
+    ResetVariable, SetVariable, SortExpr, Statement as PlanStatement, Subquery,
+    ToStringifiedPlan, TransactionAccessMode, TransactionConclusion, TransactionEnd,
     TransactionIsolationLevel, TransactionStart, Volatility, WriteOp, cast, col,
 };
 use sqlparser::ast::{
@@ -2610,42 +2610,24 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         .map(|transformed| transformed.data)
     }
 
-    /// Return true if an expression contains a subquery whose embedded plan
-    /// has an outer reference qualified by `qualifier`.
+    /// Return true if an expression contains a subquery correlated to
+    /// `qualifier`, accounting for aliases introduced by intervening subquery
+    /// scopes.
     fn has_outer_reference_to_qualifier(
         expr: &Expr,
         qualifier: &TableReference,
     ) -> Result<bool> {
         let mut found = false;
         expr.apply(|expr| {
-            let subquery = match expr {
-                Expr::Exists(exists) => Some(&exists.subquery),
-                Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
-                Expr::SetComparison(set_comparison) => Some(&set_comparison.subquery),
-                Expr::ScalarSubquery(subquery) => Some(subquery),
-                _ => None,
-            };
-
-            if let Some(subquery) = subquery {
-                subquery.subquery.apply_with_subqueries(|plan| {
-                    plan.apply_expressions(|expr| {
-                        expr.apply(|expr| {
-                            if let Expr::OuterReferenceColumn(_, column) = expr
-                                && column.relation.as_ref() == Some(qualifier)
-                            {
-                                found = true;
-                                Ok(TreeNodeRecursion::Stop)
-                            } else {
-                                Ok(TreeNodeRecursion::Continue)
-                            }
-                        })
-                    })?;
-                    Ok(if found {
-                        TreeNodeRecursion::Stop
-                    } else {
-                        TreeNodeRecursion::Continue
-                    })
-                })?;
+            if let Some(subquery) = Self::expr_subquery(expr)
+                && Self::plan_has_outer_reference_to_qualifier(
+                    &subquery.subquery,
+                    qualifier,
+                    &[],
+                    None,
+                )?
+            {
+                found = true;
             }
 
             Ok(if found {
@@ -2655,6 +2637,164 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
         })?;
         Ok(found)
+    }
+
+    fn expr_subquery(expr: &Expr) -> Option<&Subquery> {
+        match expr {
+            Expr::Exists(exists) => Some(&exists.subquery),
+            Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
+            Expr::SetComparison(set_comparison) => Some(&set_comparison.subquery),
+            Expr::ScalarSubquery(subquery) => Some(subquery),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn plan_has_outer_reference_to_qualifier(
+        plan: &LogicalPlan,
+        qualifier: &TableReference,
+        outer_scopes: &[DFSchema],
+        lateral_scope: Option<&DFSchema>,
+    ) -> Result<bool> {
+        // Correlated lateral relations use an explicit Subquery plan node
+        // rather than an expression.
+        if let LogicalPlan::Subquery(subquery) = plan {
+            let mut subquery_outer_scopes = outer_scopes.to_vec();
+            if let Some(lateral_scope) = lateral_scope {
+                subquery_outer_scopes.push(lateral_scope.clone());
+            }
+            return Self::plan_has_outer_reference_to_qualifier(
+                &subquery.subquery,
+                qualifier,
+                &subquery_outer_scopes,
+                None,
+            );
+        }
+
+        let local_scope = Self::plan_expression_scope(plan);
+
+        let mut found = false;
+        plan.apply_expressions(|expr| {
+            expr.apply(|expr| {
+                if let Expr::OuterReferenceColumn(_, column) = expr
+                    && column.relation.as_ref() == Some(qualifier)
+                    && !outer_scopes
+                        .iter()
+                        .rev()
+                        .any(|scope| scope.maybe_index_of_column(column).is_some())
+                {
+                    found = true;
+                } else if let Some(subquery) = Self::expr_subquery(expr) {
+                    let mut nested_outer_scopes = outer_scopes.to_vec();
+                    if let Some(local_scope) = &local_scope {
+                        nested_outer_scopes.push(local_scope.clone());
+                    }
+                    if Self::plan_has_outer_reference_to_qualifier(
+                        &subquery.subquery,
+                        qualifier,
+                        &nested_outer_scopes,
+                        None,
+                    )? {
+                        found = true;
+                    }
+                }
+
+                Ok(if found {
+                    TreeNodeRecursion::Stop
+                } else {
+                    TreeNodeRecursion::Continue
+                })
+            })
+        })?;
+        if found {
+            return Ok(true);
+        }
+
+        if let LogicalPlan::Join(join) = plan {
+            if Self::plan_has_outer_reference_to_qualifier(
+                &join.left,
+                qualifier,
+                outer_scopes,
+                lateral_scope,
+            )? {
+                return Ok(true);
+            }
+
+            let mut right_lateral_scope =
+                lateral_scope.cloned().unwrap_or_else(DFSchema::empty);
+            right_lateral_scope.merge(join.left.schema());
+            if let Some(subquery) = Self::lateral_subquery(&join.right) {
+                let mut lateral_outer_scopes = outer_scopes.to_vec();
+                lateral_outer_scopes.push(right_lateral_scope);
+                return Self::plan_has_outer_reference_to_qualifier(
+                    &subquery.subquery,
+                    qualifier,
+                    &lateral_outer_scopes,
+                    None,
+                );
+            }
+
+            return Self::plan_has_outer_reference_to_qualifier(
+                &join.right,
+                qualifier,
+                outer_scopes,
+                Some(&right_lateral_scope),
+            );
+        }
+
+        for input in plan.inputs() {
+            if Self::plan_has_outer_reference_to_qualifier(
+                input,
+                qualifier,
+                outer_scopes,
+                lateral_scope,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Return the schema used to resolve subqueries in this node's expressions.
+    ///
+    /// Most relational expressions use their input schema. LIMIT/OFFSET
+    /// expressions are deliberately resolved against an empty schema, so they
+    /// must not inherit aliases from the limited input.
+    fn plan_expression_scope(plan: &LogicalPlan) -> Option<DFSchema> {
+        match plan {
+            LogicalPlan::Projection(_)
+            | LogicalPlan::Filter(_)
+            | LogicalPlan::Repartition(_)
+            | LogicalPlan::Window(_)
+            | LogicalPlan::Aggregate(_)
+            | LogicalPlan::Join(_)
+            | LogicalPlan::Sort(_)
+            | LogicalPlan::TableScan(_)
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::Distinct(_) => {
+                let inputs = plan.inputs();
+                Some(if inputs.is_empty() {
+                    plan.schema().as_ref().clone()
+                } else {
+                    merge_schema(&inputs)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the correlated subquery wrapped by a lateral relation, if this
+    /// plan has the shape produced by `create_relation_subquery`.
+    fn lateral_subquery(mut plan: &LogicalPlan) -> Option<&Subquery> {
+        loop {
+            match plan {
+                LogicalPlan::Subquery(subquery) => return Some(subquery),
+                LogicalPlan::SubqueryAlias(alias) => plan = &alias.input,
+                LogicalPlan::Projection(projection) => plan = &projection.input,
+                _ => return None,
+            }
+        }
     }
 
     fn merge_target_column_name(
