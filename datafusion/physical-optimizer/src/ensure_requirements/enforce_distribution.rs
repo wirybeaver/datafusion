@@ -1291,7 +1291,8 @@ pub fn ensure_distribution(
                 && roundrobin_beneficial_stats
                 // Unless partitioning increases the partition count, it is not beneficial:
                 && increases_partition_count
-                && !preserve_partial_aggregate_partitioning;
+                && !preserve_partial_aggregate_partitioning
+                && !matches!(child.plan.output_partitioning(), Partitioning::Grouped(_));
 
             // When `repartition_file_scans` is set, attempt to increase
             // parallelism at the source.
@@ -1338,7 +1339,11 @@ pub fn ensure_distribution(
                     } else {
                         !partitioning_satisfied
                             || (target_partitions > child_partitions
-                                && !preserve_satisfying_file_partitioning)
+                                && !preserve_satisfying_file_partitioning
+                                && !matches!(
+                                    child.plan.output_partitioning(),
+                                    Partitioning::Grouped(_)
+                                ))
                     };
                     let should_add_hash_repartition =
                         hash_necessary && needs_hash_repartition;

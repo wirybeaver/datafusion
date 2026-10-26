@@ -87,6 +87,11 @@ impl From<&Partitioning> for FFI_Partitioning {
                     ordering,
                 })
             }
+            // The stable FFI ABI has no source-group descriptor. Losing the
+            // optimization is safe; claiming native hashing would not be.
+            Partitioning::Grouped(grouped) => {
+                Self::UnknownPartitioning(grouped.partition_count())
+            }
             Partitioning::UnknownPartitioning(size) => Self::UnknownPartitioning(*size),
         }
     }
